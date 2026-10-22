@@ -1082,6 +1082,15 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return set()
 
 
+def _opencode_tokens(value: Any) -> tuple[int, int, int, int]:
+  """(input, output, cache read, cache write) of an opencode `tokens`
+  object, each count one token_count() trusts."""
+  tokens = obj(value)
+  cache = obj(tokens.get("cache"))
+  # opencode keeps thinking tokens out of output; both are generated.
+  return token_count(tokens.get("input")), token_count(tokens.get("output")) + token_count(tokens.get("reasoning")), token_count(cache.get("read")), token_count(cache.get("write"))
+
+
 def _opencode_row(session_id: Any, entry: Any, row_type: str, created: Any, accept: Accept, empty: bool = False) -> UsageRow | None:
   # Shared by both message stores. The original `message` table keeps the
   # provider and model at the top level; the V2 `session_message` table nests
@@ -1096,13 +1105,7 @@ def _opencode_row(session_id: Any, entry: Any, row_type: str, created: Any, acce
   if not accept(provider, model, entry):
     return None
   # A user row spent nothing, whatever it claims.
-  tokens = obj(entry.get("tokens")) if entry.get("role") != "user" else {}
-  cache = obj(tokens.get("cache"))
-  input_tokens = token_count(tokens.get("input"))
-  # opencode keeps thinking tokens out of output; both are generated.
-  output_tokens = token_count(tokens.get("output")) + token_count(tokens.get("reasoning"))
-  cache_read = token_count(cache.get("read"))
-  cache_write = token_count(cache.get("write"))
+  input_tokens, output_tokens, cache_read, cache_write = _opencode_tokens(entry.get("tokens") if entry.get("role") != "user" else {})
   if not (input_tokens or output_tokens or cache_read or cache_write or empty):
     return None
   # The message's own time, else the row's: none at all is today's, and an
@@ -1260,25 +1263,34 @@ def scan_opencode(providers: Iterable[str], accept: Accept) -> tuple[list[UsageR
       # The first step that spent tokens on each user message across every
       # provider, so a tool loop that switches providers books its prompt
       # once, on whichever collector took that step. Only valid JSON is read,
-      # so one odd row can't fail the query. A session's first steps are its
-      # own, so only the sessions above are read, through opencode's index on
-      # session_id, each id as stored.
+      # so one odd row can't fail the query, and a step counts as first only
+      # if take() would keep it: its tokens and time pass the same checks,
+      # so a damaged step never takes the prompt from a valid one after it.
+      # A session's first steps are its own, so only the sessions above are
+      # read, through opencode's index on session_id, each id as stored.
       sessions = list(dict.fromkeys(session_id for _, session_id, _, _ in own_steps + own_prompts))
-      spent = " + ".join(f"COALESCE(json_extract(j, '$.tokens.{key}'), 0)" for key in ("input", "output", "reasoning", "cache.read", "cache.write"))
-      for session_id, parent, first_id in conn.execute(
-        "SELECT session_id, parent, id FROM (SELECT session_id, parent, id,"
-        " ROW_NUMBER() OVER (PARTITION BY session_id, parent ORDER BY created, CAST(id AS TEXT)) AS n"
-        " FROM (SELECT id, session_id, j, since, json_extract(j, '$.parentID') AS parent, json_extract(j, '$.time.created') AS created"
+      for session_id, parent, first_id, created, tokens, since in conn.execute(
+        "SELECT session_id, parent, id, created, tokens, since"
+        " FROM (SELECT id, session_id, j, since, json_extract(j, '$.parentID') AS parent, json_extract(j, '$.time.created') AS created,"
+        " json_extract(j, '$.tokens') AS tokens"
         f" FROM (SELECT {row_id} AS id, m.session_id, CASE WHEN json_valid(m.data) THEN m.data END AS j, {session_created} AS since"
         f" FROM {source} WHERE m.session_id IN (SELECT value FROM json_each(?))"
         " AND m.data LIKE '%\"parentID\"%' AND m.data LIKE '%\"role\"%:%\"assistant\"%'))"
-        " WHERE typeof(parent) = 'text' AND parent != '' AND (created IS NULL OR created > 0)"
-        " AND (since IS NULL OR created IS NULL OR created >= since)"
+        " WHERE typeof(parent) = 'text' AND parent != '' AND typeof(tokens) = 'text'"
         " AND json_extract(j, '$.summary') IS NOT 1 AND json_extract(j, '$.mode') IS NOT 'compaction'"
-        f" AND {spent} > 0) WHERE n = 1",
+        " ORDER BY session_id, parent, created, CAST(id AS TEXT)",
         (json.dumps(sessions, default=str),),
       ) if sessions else ():
-        firsts[(str(session_id), str(parent))] = str(first_id)
+        turn = (str(session_id), str(parent))
+        if turn in firsts:
+          continue
+        try:
+          spent_at = number(created)
+          if not any(_opencode_tokens(json.loads(tokens))) or local_day(created) is None or (spent_at and spent_at < number(since)):
+            continue
+        except Exception:
+          continue
+        firsts[turn] = str(first_id)
       for message_id, session_id, raw, since in own_steps:
         take(message_id, session_id, raw, "", None, since)
       # A typed prompt no step answered (its request failed, or none came)

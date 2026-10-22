@@ -1048,6 +1048,34 @@ check(
   json.dumps(by_provider),
 )
 
+# A damaged step the reader rejects (a boolean token count, an untrusted
+# time) is never an opencode prompt's first step, so the valid step after it
+# with the same parentID still books the prompt.
+damaged_db = work / "damaged.db"
+conn = sqlite3.connect(damaged_db)
+conn.execute("CREATE TABLE session (id text PRIMARY KEY, parent_id text, time_created integer NOT NULL)")
+conn.execute("CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)")
+# ses_when has no session row, so no fork time bounds its steps.
+conn.execute("INSERT INTO session VALUES ('ses_bool', NULL, ?)", (fork_ms,))
+conn.executemany("INSERT INTO message VALUES (?, ?, ?, ?, ?)", [
+  ("msg_bu", "ses_bool", now_ms, now_ms, asked(now_ms)),
+  ("msg_b1", "ses_bool", now_ms + 1, now_ms + 1, json.dumps(json.loads(step("msg_bu", 0, now_ms + 1, finish="tool-calls")) | {"tokens": {"input": True, "output": 0}})),
+  ("msg_b2", "ses_bool", now_ms + 2, now_ms + 2, step("msg_bu", 610, now_ms + 2, finish="stop")),
+  ("msg_wu", "ses_when", now_ms, now_ms, asked(now_ms)),
+  ("msg_w1", "ses_when", now_ms + 1, now_ms + 1, json.dumps(json.loads(step("msg_wu", 50, now_ms + 1, finish="tool-calls")) | {"time": {"created": True}})),
+  ("msg_w2", "ses_when", now_ms + 2, now_ms + 2, step("msg_wu", 620, now_ms + 2, finish="stop")),
+])
+conn.commit()
+conn.close()
+os.environ["OPENCODE_DB"] = str(damaged_db)
+rows, complete = collectors.scan_opencode(["demo"], accept_demo)
+os.environ.pop("OPENCODE_DB")
+check(
+  "a step the reader rejects never takes an opencode prompt from the valid step after it",
+  complete and sorted((row.input_tokens, row.prompts) for row in rows) == [(610, 1), (620, 1)],
+  json.dumps([row._asdict() for row in rows]),
+)
+
 # ------------------------------------------------------------- endpoints
 
 # A base URL's host says who bills what it serves: a provider's own host or
