@@ -141,7 +141,8 @@ expect("a keyring login, which can't be told apart, keeps no limits", keyring["l
 # An API-key login has no plan limits, so no app-server is started to ask and
 # there is no sign-in to ask for: Codex's own auth_mode, or a key without
 # ChatGPT tokens. A ChatGPT auth_mode beside a key still asks Codex.
-for shape in ({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-test"}, {"OPENAI_API_KEY": "sk-test"}, {"OPENAI_API_KEY": "sk-test", "tokens": None}):
+for shape in ({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-test"}, {"OPENAI_API_KEY": "sk-test"}, {"OPENAI_API_KEY": "sk-test", "tokens": None},
+              {"OPENAI_API_KEY": "sk-test", "tokens": {"id_token": "x", "access_token": "y", "refresh_token": "z"}}):
   write_json(home() / ".codex" / "auth.json", shape)
   before_starts = starts()
   keyed = [codex("ok"), codex("ok", "--limits-only")]

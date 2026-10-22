@@ -512,7 +512,8 @@ def has_codex_credentials(codex_home, env):
 
 # An API key in auth.json signs Codex in to the API, which bills by the token
 # and has no plan limits: account/rateLimits/read only says it wants ChatGPT.
-# Codex reads auth_mode first, else an API key without ChatGPT tokens.
+# Codex reads auth_mode first, else any API key, ChatGPT tokens beside it or
+# not, as an older login wrote them both.
 def api_key_login(codex_home, env):
   if env.get("CODEX_ACCESS_TOKEN"):
     return False
@@ -533,7 +534,7 @@ def api_key_login(codex_home, env):
     return False
   if auth.get("auth_mode") is not None:
     return auth["auth_mode"] == "apikey"
-  return bool(auth.get("OPENAI_API_KEY")) and not auth.get("tokens")
+  return bool(auth.get("OPENAI_API_KEY"))
 
 
 # The environment a home's app-server runs in. CODEX_ACCESS_TOKEN signs in
