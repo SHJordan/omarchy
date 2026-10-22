@@ -164,9 +164,25 @@ def turn(n, provider, model):
           {"type": "message", "id": f"fa{n}", "timestamp": stamp, "message": {"role": "assistant", "provider": provider, "model": model, "usage": usage(100), "timestamp": 2}}]
 
 
+# A fork copies its parent's whole history, as pi --fork does. A collector
+# that owns one fork's own reply reads the other files of the fork tree
+# only when they hold a copy of a prompt it booked: here none does.
+forks = work / "forks"
 history = [{"type": "model_change", "id": "fm", "timestamp": stamp, "provider": "busy", "modelId": "busy-model"}]
 for n in range(20):
   history += turn(n, "busy", "busy-model")
+write(forks / "parent.jsonl", [{"type": "session", "version": 3, "id": "fp", "timestamp": stamp, "cwd": "/proj"}, *history])
+for n in range(6):
+  extra = []
+  if n == 5:
+    extra = [{"type": "model_change", "id": "fk", "timestamp": stamp, "provider": "late", "modelId": "late-model"}, *turn("k", "late", "late-model")]
+  write(forks / f"fork-{n}.jsonl", [{"type": "session", "version": 3, "id": f"ff{n}", "timestamp": stamp, "cwd": "/proj", "parentSession": str(forks / "parent.jsonl")}, *history, *extra])
+for key in parsed:
+  parsed[key] = set() if key != "lines" else 0
+rows, complete = collectors.scan_pi_sessions(r'"provider"\s*:\s*"late"', lambda name, model, entry: name == "late", roots=[forks])
+check("a fork's own reply parses no other file of its fork tree that holds none of its prompts",
+      complete and parsed["files"] == {"fork-5.jsonl"} and [(row.input_tokens, row.prompts) for row in rows] == [(100, 1)],
+      json.dumps({"files": sorted(parsed["files"]), "rows": [row._asdict() for row in rows]}))
 
 # pi deletes a session from /resume and leaves its forks naming it. The
 # fork's copies then count under the fork, and the scan is complete.

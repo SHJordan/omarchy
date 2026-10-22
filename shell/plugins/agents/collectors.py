@@ -1055,16 +1055,18 @@ def scan_pi_sessions(pattern: str, accept: Accept, roots: Iterable[Path] | None 
       fold(index, path)
 
   # A prompt's copies live in the forks of the session it was typed in, so
-  # the other files of those fork trees are read for their bookings alone:
-  # each collector then picks the same one among them.
+  # the other files of those fork trees holding a prompt this collector
+  # booked are read for their bookings alone: each collector then picks the
+  # same one among them. Only a prompt with an entry id has copies elsewhere.
+  ids = {ask[1] for *_, asks in found for ask in asks if ask[0] == "entry"}
   children: dict[str, list[str]] = {}
-  for name in matching_files([os.fsencode(root) for root in roots], [r'"parentSession"']) if read else ():
+  for name in matching_files([os.fsencode(root) for root in roots], [r'"parentSession"']) if ids else ():
     path = os.fsdecode(name)
     parent = parents.setdefault(path, pi_parent_session(path))
     if parent:
       children.setdefault(parent, []).append(path)
   family: set[str] = set()
-  queue = list(read)
+  queue = list(read) if ids else []
   while queue:
     path = queue.pop()
     if path in family:
@@ -1072,6 +1074,17 @@ def scan_pi_sessions(pattern: str, accept: Accept, roots: Iterable[Path] | None 
     family.add(path)
     queue.extend(ancestors(path) | set(children.get(path, ())))
   others = sorted(os.fsencode(path) for path in family - read if any(Path(path).is_relative_to(root) for root in roots))
+  if others and all(re.fullmatch(r"[A-Za-z0-9_.:-]+", key) for key in ids):
+    # Such an id is written as itself, quoted, so a file holding none of
+    # them quoted holds no copy, and is never parsed.
+    try:
+      with tempfile.NamedTemporaryFile("w", suffix=".ids") as quoted:
+        quoted.write("".join(f'"{key}"\n' for key in sorted(ids)))
+        quoted.flush()
+        others = sorted({os.fsencode(os.path.realpath(os.fsdecode(name))) for name in b"".join(run_rg(["--files-with-matches", "--null", "--fixed-strings", "-f", quoted.name], others)).split(b"\0") if name})
+    except OSError:
+      # With nowhere to write the ids, every file of the family is read.
+      pass
   for kind, path, line_number, entry in match_events(others, [context]):
     if kind == "end":
       fold(None, path)
