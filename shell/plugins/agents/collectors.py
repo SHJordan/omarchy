@@ -747,14 +747,33 @@ def _pi_line(entry: Any) -> tuple | None:
   return None
 
 
+def _pi_unsent(message: dict) -> bool:
+  """Whether a failed omp reply never reached its provider.
+
+  omp times every request it makes, a failed one included (`duration`, and
+  `errorStatus` for an HTTP answer), so an error it writes with its
+  `errorId` and neither, like a refused local credential, was raised before
+  sending. pi writes no `errorId`, and an aborted request may have gone out.
+  """
+  return message.get("stopReason") == "error" and "errorId" in message and not any(key in message for key in ("duration", "errorStatus", "responseId"))
+
+
 def _pi_key(entry: dict, timestamp: Any, path: str) -> tuple:
   """The dedup key of one session line.
 
-  A fork copies its parent's entries with their id and timestamp, so the
+  A reply with a response id is that response, at the time it came. A
+  fork copies its parent's entries with their id and timestamp, so the
   pair names a message across files; an id alone only within its file. A
   line without an id has nothing tying it to a copy elsewhere, so it is its
   own and always counts.
   """
+  message = obj(entry.get("message"))
+  response = message.get("responseId")
+  if message.get("role") == "assistant" and isinstance(response, str) and response and message.get("timestamp") is not None:
+    # omp writes a reply that overflowed the model's context window twice,
+    # as siblings with new ids; the response they repeat, and a fork's copy
+    # of it, is the one request the provider served.
+    return ("response", str(message.get("provider") or ""), response, str(message["timestamp"]))
   message_id = str(entry.get("id") or "")
   if message_id and timestamp:
     return ("entry", message_id, str(timestamp))
@@ -798,7 +817,8 @@ def _pi_rows(path: str, lines: list[tuple[int, Any]], accept: Accept) -> Iterato
   failed, or none came) is a row of its own without tokens, on the model
   the session was set to use for it: the failed reply, which pi and omp
   write with its provider and no usage, else the last model switch or reply
-  before it; with neither it counts nowhere. A prompt counts on its own day,
+  before it; with neither, or when omp refused the request before sending
+  it, it counts nowhere. A prompt counts on its own day,
   not the reply's, and one whose time can't be trusted doesn't count. A file
   with no user messages at all, as only a writer copying pi's format leaves,
   keeps a prompt per reply.
@@ -810,13 +830,14 @@ def _pi_rows(path: str, lines: list[tuple[int, Any]], accept: Accept) -> Iterato
   # Each typed prompt no reply has answered yet: (line number, dedup key,
   # day or None for an untrusted time, the model the session was on).
   asked: list[tuple[int, tuple, str | None, tuple | None]] = []
-  # The first reply since those prompts that spent nothing: a failed request.
+  # The first reply since those prompts that spent nothing: a failed request,
+  # or () for one omp refused before sending it.
   failed: tuple | None = None
 
   def unanswered() -> Iterator[tuple[int, tuple, UsageRow]]:
     for line_number, key, day, before in asked:
-      target = failed or before
-      if day is None or target is None:
+      target = before if failed is None else failed
+      if day is None or not target:
         continue
       provider, model, reference = target
       try:
@@ -839,9 +860,13 @@ def _pi_rows(path: str, lines: list[tuple[int, Any]], accept: Accept) -> Iterato
       if timestamp is None:
         timestamp = obj(entry.get("message")).get("timestamp")
       if kind == "prompt":
-        if failed is not None:
+        # Only a prompt no reply answered is still asked: it is its own row,
+        # so a fork that copies it books it under the same key. One with no
+        # model known yet rides on the next reply, as before.
+        if asked:
           yield from unanswered()
-          asked, failed = [], None
+          asked = [prompt for prompt in asked if failed is None and prompt[3] is None]
+          failed = None
         asked.append((line_number, _pi_key(entry, timestamp, path), local_day(timestamp), context))
         continue
       if kind == "summary":
@@ -859,7 +884,7 @@ def _pi_rows(path: str, lines: list[tuple[int, Any]], accept: Accept) -> Iterato
         if counted is not None:
           answered, asked, failed = asked, [], None
         elif asked and failed is None:
-          failed = (provider, model, reference)
+          failed = () if _pi_unsent(reference) else (provider, model, reference)
       if not accept(provider, model, reference):
         continue
     except Exception:

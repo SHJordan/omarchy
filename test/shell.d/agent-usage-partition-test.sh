@@ -2034,3 +2034,131 @@ if [[ -z $kimchi_gateway_report ]]; then
 else
   fail "usage Kimchi's gateway billed through pi, omp, opencode, Claude Code or Codex counts once, under kimchi" "$kimchi_gateway_report"
 fi
+
+# ------------------------------------------- requests that never got a reply
+
+# Shapes pi 1.4.0 and omp 18.12.6 wrote against a mock server. A prompt
+# whose agent was killed mid-request leaves no assistant line, so it books
+# on the model the session was on, never on the next provider's reply, and a
+# fork copying it books it once. omp writes a reply that overflowed the
+# model's context window twice under new ids, one response served once. A
+# prompt omp refused before sending (Muse Code's invalid credential, an
+# errorId and no duration) counts nowhere; one a server refused (a duration
+# and a 400) counts.
+STRANDED_HOME="$WORK/stranded"
+python3 - "$STRANDED_HOME" <<'PY'
+import json
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+home = Path(sys.argv[1])
+stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+now_ms = int(time.time() * 1000) - 1000
+cost = {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}
+zero = {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": cost}
+
+
+def spent(n):
+  return {"input": 141601 + n, "output": 1456, "cacheRead": 1476, "cacheWrite": 0, "totalTokens": 144533 + n, "reasoningTokens": 1409, "cost": cost}
+
+
+def user(n, omp=False):
+  message = {"role": "user", "content": [{"type": "text", "text": "Say hi"}], "timestamp": now_ms}
+  if omp:
+    message["attribution"] = "user"
+  return {"type": "message", "id": f"u{n}", "parentId": None, "timestamp": stamp, "message": message}
+
+
+def reply(n, provider, model, usage, **extra):
+  message = {"role": "assistant", "content": [{"type": "text", "text": "hi"}], "api": "openai-completions", "provider": provider, "model": model,
+             "usage": usage, "stopReason": "stop", "timestamp": now_ms, **extra}
+  return {"type": "message", "id": f"a{n}", "parentId": f"u{n}", "timestamp": stamp, "message": message}
+
+
+def switch(n, provider, model, omp=False):
+  if omp:
+    return {"type": "model_change", "id": f"m{n}", "timestamp": stamp, "model": f"{provider}/{model}"}
+  return {"type": "model_change", "id": f"m{n}", "timestamp": stamp, "provider": provider, "modelId": model}
+
+
+def write(path, lines):
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+
+pi = home / ".pi/agent/sessions/--home-me--"
+omp = home / ".omp/agent/sessions/-"
+# pi: killed waiting on Z.ai, then switched to DeepSeek, which answered.
+write(pi / "hang-then-switched.jsonl", [
+  {"type": "session", "version": 3, "id": "s1", "timestamp": stamp, "cwd": "/home/me"},
+  switch(1, "zai", "e2e-hangpi2"), user(11),
+  switch(12, "deepseek", "e2e-hangpi2ds"), user(12), reply(12, "deepseek", "e2e-hangpi2ds", spent(12), responseId="chatcmpl-12"),
+])
+# pi: killed waiting on Z.ai, then `--fork` onto DeepSeek, which answered.
+parent = [
+  {"type": "session", "version": 3, "id": "s2", "timestamp": stamp, "cwd": "/home/me"},
+  switch(2, "zai", "e2e-hangfork"), user(21),
+]
+write(pi / "hang-parent.jsonl", parent)
+write(pi / "hang-fork.jsonl", [
+  {"type": "session", "version": 3, "id": "s3", "timestamp": stamp, "cwd": "/home/me", "parentSession": str(pi / "hang-parent.jsonl")},
+  *parent[1:],
+  switch(22, "deepseek", "e2e-hangforkds"), user(22), reply(22, "deepseek", "e2e-hangforkds", spent(22), responseId="chatcmpl-22"),
+])
+# omp: one response past the declared context window, written twice.
+twice = reply(31, "deepseek", "e2e-dupb", spent(31), responseId="chatcmpl-31", duration=3.1, ttft=1.2, completedAt=now_ms)
+again = json.loads(json.dumps(twice))
+again["id"] = "a31b"
+again["message"]["errorId"] = 0
+write(omp / "overflow.jsonl", [
+  {"type": "session", "id": "s4", "timestamp": stamp, "cwd": "/home/me"},
+  switch(3, "deepseek", "e2e-dupb", omp=True), user(31, omp=True), twice, again,
+])
+# omp: Muse Code's credential refused before sending, twice.
+refusal = {"stopReason": "error", "errorMessage": "Muse Code credential is invalid; sign in again", "errorId": 0, "completedAt": now_ms}
+muse = [reply(n, "muse-code", "e2e-musecode-omp", zero) for n in (41, 42)]
+for line in muse:
+  line["message"].update(refusal)
+write(omp / "refused-locally.jsonl", [
+  {"type": "session", "id": "s5", "timestamp": stamp, "cwd": "/home/me"},
+  switch(4, "muse-code", "e2e-musecode-omp", omp=True), user(41, omp=True), muse[0], user(42, omp=True), muse[1],
+])
+# omp: a 400 from Z.ai's server.
+served = reply(51, "zai", "e2e-failomp", zero)
+served["message"].update({"stopReason": "error", "errorMessage": "400 mock refused FAILME", "errorStatus": 400, "errorId": 400, "duration": 3.2, "completedAt": now_ms})
+write(omp / "refused-by-server.jsonl", [
+  {"type": "session", "id": "s6", "timestamp": stamp, "cwd": "/home/me"},
+  switch(5, "zai", "e2e-failomp", omp=True), user(51, omp=True), served,
+])
+PY
+run_all "$STRANDED_HOME" "$WORK/stranded-results"
+
+stranded_report=$(python3 - "$WORK/stranded-results" "${collectors[@]}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+results = Path(sys.argv[1])
+# (prompts, sessions, tokens) each collector must count; every other one none.
+expected = {"zai": (3, 3, 0), "deepseek": (3, 3, (144533 + 12) + (144533 + 22) + (144533 + 31))}
+for cid in sys.argv[2:]:
+  try:
+    record = json.loads((results / f"{cid}.json").read_text())
+  except ValueError:
+    print(f"{cid} printed no JSON record")
+    continue
+  want = expected.get(cid, (0, 0, 0))
+  got = (record.get("todayPrompts"), record.get("todaySessions"), record.get("todayTotalTokens"))
+  if got != want:
+    print(f"{cid}: prompts, sessions and tokens {got}, expected {want}")
+  if cid == "muse" and record.get("hasLocalStats"):
+    print("muse: in use for prompts that never left the machine")
+PY
+)
+if [[ -z $stranded_report ]]; then
+  pass "a prompt killed mid-request, a reply omp wrote twice and a request omp never sent each count once or nowhere"
+else
+  fail "a prompt killed mid-request, a reply omp wrote twice and a request omp never sent each count once or nowhere" "$stranded_report"
+fi
