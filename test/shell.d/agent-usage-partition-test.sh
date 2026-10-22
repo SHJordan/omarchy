@@ -2267,3 +2267,90 @@ if [[ -z $oc_scale_report ]]; then
 else
   fail "a collector's opencode scan costs a few gated scans of the store, not a pass over every provider's steps" "$oc_scale_report"
 fi
+
+# ------------------- Codex profiles and a claimed id on the user's own hardware
+
+# Codex 0.163 applies a <name>.config.toml profile only to a run given
+# --profile, and that run's rollout still records only
+# `"model_provider":"openai"`, so a profile's openai_base_url says nothing
+# about plain `codex` runs: here it moves only the rollouts on the model the
+# profile sets (zp941), while ChatGPT-plan rollouts (zp940), and a model no
+# profile ties (zp943), stay codex's. A profile setting an OpenAI model can't
+# be told from a plain run and moves nothing. A model_providers entry whose
+# id another collector claims but whose base_url is this machine, as a
+# self-hosted Kimchi gateway's `kimchi codex` setup writes it, is local's:
+# the base URL decides (zp942). The lines are shaped as Codex 0.163 wrote
+# them in real `codex exec` runs.
+CODEX_PROFILE_HOME="$WORK/codex-profiles"
+mkdir -p "$CODEX_PROFILE_HOME/.codex"
+python3 - "$CODEX_PROFILE_HOME" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+home = Path(sys.argv[1])
+stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+rollouts = home / ".codex/sessions" / datetime.now().strftime("%Y/%m/%d")
+rollouts.mkdir(parents=True)
+
+
+def rollout(tag, provider, model, n):
+  thread = f"01a164a4-8b38-7013-9a23-709319c3{n:04d}"
+  turn = f"01a164a4-8b8b-71f1-b648-20be1fa2{n:04d}"
+  usage = {"input_tokens": 18234 + n, "cached_input_tokens": 71, "cache_write_input_tokens": 31, "output_tokens": 51, "reasoning_output_tokens": 0, "total_tokens": 18285 + n}
+  item = {"type": "UserMessage", "id": f"01a164a4-8c01-7231-a532-dda74a01{n:04d}", "content": [{"type": "text", "text": "go", "text_elements": []}]}
+  lines = [
+    {"timestamp": stamp, "ordinal": 0, "type": "session_meta", "payload": {"session_id": thread, "id": thread, "cli_version": "0.163.0", "history_mode": "paginated", "originator": "codex_exec", "source": "exec", "thread_source": "user", "model_provider": provider}},
+    {"timestamp": stamp, "ordinal": 5, "type": "turn_context", "payload": {"model": model, "turn_id": turn}},
+    {"timestamp": stamp, "ordinal": 8, "type": "event_msg", "payload": {"type": "item_completed", "thread_id": thread, "turn_id": turn, "item": item}},
+    {"timestamp": stamp, "ordinal": 10, "type": "token_usage_record", "payload": {"thread_id": thread, "turn_id": turn, "session_id": thread, "response_id": f"resp_zp_{n:04d}", "usage": usage, "turn_token_usage": usage, "thread_token_usage": usage}},
+  ]
+  (rollouts / f"rollout-2026-10-22T13-24-27-{thread}.jsonl").write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+
+rollout("zp940", "openai", "gpt-5.1-codex-zp940", 940)
+rollout("zp941", "openai", "hf:zai-org/GLM-4.6-zp941", 941)
+rollout("zp942", "kimchi", "kimi-k2-zp942", 942)
+rollout("zp943", "openai", "qwen3-coder-zp943", 943)
+codex = home / ".codex"
+(codex / "config.toml").write_text(
+  'model = "gpt-5.1-codex-zp940"\n\n'
+  '[model_providers.kimchi]\nname = "Kimchi Gateway"\nbase_url = "http://127.0.0.1:18491/openai/v1"\nwire_api = "responses"\n'
+)
+(codex / "syn.config.toml").write_text('model = "hf:zai-org/GLM-4.6-zp941"\nopenai_base_url = "https://api.synthetic.new/openai/v1"\n')
+(codex / "or.config.toml").write_text('model = "gpt-5.1-codex-zp940"\nopenai_base_url = "https://openrouter.ai/api/v1"\n')
+PY
+run_all "$CODEX_PROFILE_HOME" "$WORK/codex-profile-results"
+codex_profile_report=$(python3 - "$WORK/codex-profile-results" "${collectors[@]}" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+results = Path(sys.argv[1])
+owners = {"zp940": "codex", "zp941": "synthetic", "zp942": "local", "zp943": "codex"}
+counts = {"codex": (2, 2), "synthetic": (1, 1), "local": (1, 1), "openrouter": (0, 0), "kimchi": (0, 0)}
+seen = {tag: set() for tag in owners}
+for cid in sys.argv[2:]:
+  try:
+    record = json.loads((results / f"{cid}.json").read_text())
+  except ValueError:
+    print(f"{cid} printed no JSON record")
+    continue
+  if cid in counts and (record.get("totalPrompts"), record.get("totalSessions")) != counts[cid]:
+    print(f"{cid} counted prompts and sessions {(record.get('totalPrompts'), record.get('totalSessions'))}, expected {counts[cid]}")
+  for model, bucket in (record.get("modelUsage") or {}).items():
+    if any(bucket.get(key) for key in ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens")):
+      for tag in re.findall(r"zp94\d", model):
+        seen[tag].add(cid)
+for tag, owner in owners.items():
+  if seen[tag] != {owner}:
+    print(f"{tag}: counted by {sorted(seen[tag]) or 'nobody'}, expected {owner}")
+PY
+)
+if [[ -z $codex_profile_report ]]; then
+  pass "a Codex profile's openai_base_url moves only the rollouts on its model, and a claimed id on this machine is local's"
+else
+  fail "a Codex profile's openai_base_url moves only the rollouts on its model, and a claimed id on this machine is local's" "$codex_profile_report"
+fi

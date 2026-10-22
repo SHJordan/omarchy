@@ -2655,30 +2655,56 @@ def codex_rollouts(cache_file: Path | None, reuse: bool = True, native: bool = F
     return scan(rollouts(), load())
 
 
-def _codex_config_urls(path: Path) -> dict[str, str]:
+def _codex_config(path: Path) -> dict[str, Any]:
   try:
     with path.open("rb") as handle:
-      config = tomllib.load(handle)
+      return tomllib.load(handle)
   except (OSError, UnicodeError, tomllib.TOMLDecodeError):
     return {}
-  providers = config.get("model_providers")
-  urls = {str(name).lower(): str(entry.get("base_url") or "") for name, entry in providers.items() if isinstance(entry, dict)} if isinstance(providers, dict) else {}
-  # Where the built-in provider goes in place of OpenAI's API. Codex 0.163
-  # reads it from the config only, never from OPENAI_BASE_URL.
-  if isinstance(config.get("openai_base_url"), str):
-    urls[CODEX_NATIVE_PROVIDER] = config["openai_base_url"]
-  return urls
+
+
+def codex_native_key(pid: Any) -> bool:
+  """Whether a codex_config_urls() key is the built-in provider's
+  openai_base_url, plain or a profile's (`openai@<model>`)."""
+  return pid == CODEX_NATIVE_PROVIDER or str(pid).startswith(CODEX_NATIVE_PROVIDER + "@")
 
 
 def codex_config_urls() -> dict[str, str]:
   """provider id -> base_url, from the Codex CLI's own config: the system
   layer, the user's config.toml over it, and the profiles
   (<name>.config.toml) Codex layers over that when one is selected. The
-  built-in `openai` provider's is its openai_base_url."""
+  built-in `openai` provider's is its openai_base_url.
+
+  Codex 0.163 applies a profile only to a run given --profile, and its
+  rollouts still name only `openai`, so only the system layer and
+  config.toml say where the built-in provider goes. A profile's
+  openai_base_url is kept as `openai@<model>` for the model it sets, the one
+  thing its rollouts can be told apart by: never an OpenAI model, which
+  plain `codex` runs too, nor the one the plain config sets, and none when
+  two profiles send that model to different places."""
   home = codex_home()
   urls: dict[str, str] = {}
+  profiles: dict[str, str | None] = {}
+  plain_model = ""
   for path in (Path("/etc/codex/config.toml"), home / "config.toml", *sorted(home.glob("*.config.toml"))):
-    urls.update(_codex_config_urls(path))
+    config = _codex_config(path)
+    providers = config.get("model_providers")
+    if isinstance(providers, dict):
+      urls.update((str(name).lower(), str(entry.get("base_url") or "")) for name, entry in providers.items() if isinstance(entry, dict))
+    model = config.get("model").strip().lower() if isinstance(config.get("model"), str) else ""
+    base = config.get("openai_base_url")
+    if path.name != "config.toml":
+      if model and isinstance(base, str) and not codex_openai_model(model):
+        profiles[model] = base if profiles.get(model, base) == base else None
+      continue
+    # Where the built-in provider goes in place of OpenAI's API. Codex 0.163
+    # reads it from the config only, never from OPENAI_BASE_URL.
+    if isinstance(base, str):
+      urls[CODEX_NATIVE_PROVIDER] = base
+    plain_model = model or plain_model
+  for model, base in profiles.items():
+    if base is not None and model != plain_model:
+      urls[f"{CODEX_NATIVE_PROVIDER}@{model}"] = base
   return urls
 
 
@@ -2705,9 +2731,9 @@ def codex_provider_urls() -> dict[str, str]:
   homes = homes if isinstance(homes, dict) else {}
   key = str(codex_home())
   known = homes.get(key)
-  known = {str(pid): url for pid, url in known.items() if isinstance(url, str) and url and pid != CODEX_NATIVE_PROVIDER} if isinstance(known, dict) else {}
+  known = {str(pid): url for pid, url in known.items() if isinstance(url, str) and url and not codex_native_key(pid)} if isinstance(known, dict) else {}
   urls = {**known, **codex_config_urls()}
-  remembered = {pid: url for pid, url in urls.items() if url and pid != CODEX_NATIVE_PROVIDER}
+  remembered = {pid: url for pid, url in urls.items() if url and not codex_native_key(pid)}
   if remembered != known:
     try:
       path.parent.mkdir(parents=True, exist_ok=True)
@@ -2739,9 +2765,17 @@ def codex_native_class(base: Any) -> str:
   return endpoint_owner(base) or "other"
 
 
-def codex_native_endpoint(urls: dict[str, str]) -> str:
-  """codex_native_class() of the config's openai_base_url."""
-  return codex_native_class(urls.get(CODEX_NATIVE_PROVIDER, ""))
+def codex_native_endpoint(urls: dict[str, str], model: Any = None) -> str:
+  """codex_native_class() of the openai_base_url a built-in turn on `model`
+  went to: the profile's that sets that model, else the plain config's."""
+  profile = f"{CODEX_NATIVE_PROVIDER}@{str(model or '').strip().lower()}"
+  return codex_native_class(urls[profile] if profile in urls else urls.get(CODEX_NATIVE_PROVIDER, ""))
+
+
+def codex_native_routed(urls: dict[str, str]) -> bool:
+  """Whether any built-in rollout may be another collector's, so
+  codex_rollouts() has to read them (its `native`)."""
+  return any(codex_native_class(url) for pid, url in urls.items() if codex_native_key(pid))
 
 
 def codex_route_owner(provider: Any, model: Any, urls: dict[str, str]) -> str | None:
@@ -2749,7 +2783,8 @@ def codex_route_owner(provider: Any, model: Any, urls: dict[str, str]) -> str | 
   that answered, or None for one no provider's collector counts (the local
   collector decides which of those `--oss` and local.json ran itself).
 
-  The built-in provider is `codex`'s until openai_base_url sends it
+  The built-in provider is `codex`'s until openai_base_url (the profile's
+  for the model a profile sets, else the plain config's) sends it
   elsewhere. A provider's host there bills all of it. Otherwise an Ollama
   cloud tag is Ollama's, and OpenAI's own models stay `codex`'s through a
   proxy that may forward to it; a self-hosted URL makes any other model
@@ -2764,7 +2799,7 @@ def codex_route_owner(provider: Any, model: Any, urls: dict[str, str]) -> str | 
   URL decides, not an id another collector claims elsewhere."""
   name = str(provider or "").strip().lower()
   if name in ("", CODEX_NATIVE_PROVIDER):
-    endpoint = codex_native_endpoint(urls)
+    endpoint = codex_native_endpoint(urls, model)
     if endpoint not in ("", "local", "other"):
       return endpoint
     if endpoint and cloud_model(model):
@@ -2786,7 +2821,7 @@ def codex_scan_match() -> dict[str, Any]:
   changing. The built-in provider's is read as codex_route_owner() reads
   it, which tells OpenAI's own API from a host nothing can place."""
   return {"codexRoutes": [
-    [pid, codex_native_class(url) if pid == CODEX_NATIVE_PROVIDER else endpoint_owner(url)] for pid, url in sorted(codex_provider_urls().items())
+    [pid, codex_native_class(url) if codex_native_key(pid) else endpoint_owner(url)] for pid, url in sorted(codex_provider_urls().items())
   ]}
 
 
@@ -2798,7 +2833,7 @@ def scan_codex_routed(owner: str, reuse: bool = True) -> tuple[list[UsageRow], b
   urls = codex_provider_urls()
   if owner != "ollama" and not any(endpoint_owner(url) == owner for url in urls.values()):
     return [], True
-  records, complete = codex_rollouts(codex_rollout_cache(), reuse=reuse, native=codex_native_endpoint(urls) != "")
+  records, complete = codex_rollouts(codex_rollout_cache(), reuse=reuse, native=codex_native_routed(urls))
   rows = [
     UsageRow(day, record["session"], owner, model, *totals[:4], prompts=totals[4])
     for record in records.values()

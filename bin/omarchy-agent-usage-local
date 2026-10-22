@@ -44,7 +44,8 @@ from collectors import (  # noqa: E402
   cached_scan,
   cloud_model,
   codex_home,
-  codex_native_endpoint,
+  codex_native_key,
+  codex_native_routed,
   codex_rollout_cache,
   codex_provider_urls,
   codex_route_owner,
@@ -141,7 +142,7 @@ class Classifier:
     # dropping it.
     self.endpoints = codex_provider_urls()
     ids = set(KNOWN_LOCAL_PROVIDERS) | self.configured
-    ids |= {pid for pid, url in self.endpoints.items() if url and self_hosted(url)}
+    ids |= {pid for pid, url in self.endpoints.items() if url and self_hosted(url) and not codex_native_key(pid)}
     self.local_ids = ids - CLAIMED_PROVIDERS
 
   def provider_is_local(self, provider):
@@ -249,7 +250,7 @@ def harness_match():
 
 def scan_codex(stats, use_file_cache):
   endpoints = classifier().endpoints
-  records, complete = codex_rollouts(codex_rollout_cache(), reuse=use_file_cache, native=codex_native_endpoint(endpoints) != "")
+  records, complete = codex_rollouts(codex_rollout_cache(), reuse=use_file_cache, native=codex_native_routed(endpoints))
   for record in records.values():
     for day, models in record["days"].items():
       for model, (input_tokens, output_tokens, cache_read, cache_write, prompts) in models.items():
