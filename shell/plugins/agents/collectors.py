@@ -689,7 +689,12 @@ def pi_parent_session(path: str) -> str | None:
   except (OSError, ValueError):
     return None
   parent = header.get("parentSession") if isinstance(header, dict) else None
-  return os.path.realpath(os.path.expanduser(parent)) if isinstance(parent, str) and parent else None
+  if not isinstance(parent, str) or not parent:
+    return None
+  parent = os.path.realpath(os.path.expanduser(parent))
+  # pi deletes a session from /resume, leaving its forks naming it: a parent
+  # that is gone, or no regular file, is none, and the fork keeps its copies.
+  return parent if os.path.isfile(parent) else None
 
 
 def _rg_text(field: Any) -> str:

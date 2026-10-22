@@ -157,4 +157,25 @@ check("a prompt counts on its own day, and an untimed one not at all",
       sorted((row.day, row.input_tokens, row.prompts) for row in rows)
       == sorted([(collectors.local_day(yesterday), 0, 1), (today, 40, 0), (today, 50, 0)]),
       json.dumps([row._asdict() for row in rows]))
+
+
+def turn(n, provider, model):
+  return [{"type": "message", "id": f"fu{n}", "timestamp": stamp, "message": {"role": "user", "content": "go", "timestamp": 1}},
+          {"type": "message", "id": f"fa{n}", "timestamp": stamp, "message": {"role": "assistant", "provider": provider, "model": model, "usage": usage(100), "timestamp": 2}}]
+
+
+history = [{"type": "model_change", "id": "fm", "timestamp": stamp, "provider": "busy", "modelId": "busy-model"}]
+for n in range(20):
+  history += turn(n, "busy", "busy-model")
+
+# pi deletes a session from /resume and leaves its forks naming it. The
+# fork's copies then count under the fork, and the scan is complete.
+orphan = work / "orphan"
+write(orphan / "fork.jsonl", [{"type": "session", "version": 3, "id": "of", "timestamp": stamp, "cwd": "/proj", "parentSession": str(orphan / "deleted.jsonl")},
+                              *history, {"type": "model_change", "id": "ok", "timestamp": stamp, "provider": "late", "modelId": "late-model"}, *turn("k", "late", "late-model")])
+for provider, want in (("busy", (2000, 20)), ("late", (100, 1))):
+  rows, complete = collectors.scan_pi_sessions(r'"provider"\s*:\s*"' + provider + '"', lambda name, model, entry: name == provider, roots=[orphan])
+  check(f"a fork whose parent was deleted is read in full for {provider}",
+        complete and (sum(row.input_tokens for row in rows), sum(row.prompts for row in rows)) == want,
+        json.dumps({"complete": complete, "rows": [row._asdict() for row in rows]}))
 PY
