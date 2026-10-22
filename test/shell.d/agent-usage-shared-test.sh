@@ -1092,6 +1092,30 @@ check(
   json.dumps([row._asdict() for row in rows]),
 )
 
+# A V2 prompt whose request failed books on its own user row's day, not the
+# failed reply's, and one typed at an untrusted time counts nowhere.
+late_db = work / "late.db"
+yesterday_ms = now_ms - 86_400_000
+conn = sqlite3.connect(late_db)
+conn.execute("CREATE TABLE session_message (id text PRIMARY KEY, session_id text NOT NULL, type text NOT NULL,"
+             " seq integer NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)")
+conn.executemany("INSERT INTO session_message VALUES (?, ?, ?, ?, ?, ?, ?)", [
+  ("v2_lu", "ses_v2_late", "user", 1, yesterday_ms, yesterday_ms, json.dumps({"text": "hi", "time": {"created": yesterday_ms}})),
+  ("v2_la", "ses_v2_late", "assistant", 2, now_ms, now_ms, v2("demo", {"input": 0})),
+  ("v2_zu", "ses_v2_untimed", "user", 1, now_ms, now_ms, json.dumps({"text": "hi", "time": {"created": 0}})),
+  ("v2_za", "ses_v2_untimed", "assistant", 2, now_ms, now_ms, v2("demo", {"input": 0})),
+])
+conn.commit()
+conn.close()
+os.environ["OPENCODE_DB"] = str(late_db)
+rows, complete = collectors.scan_opencode(["demo"], accept_demo)
+os.environ.pop("OPENCODE_DB")
+check(
+  "a V2 prompt whose request failed books on the day it was typed, an untrusted one nowhere",
+  complete and sorted((row.session, row.day, row.prompts) for row in rows if row.prompts) == [("opencode:ses_v2_late", collectors.local_day(yesterday_ms), 1)],
+  json.dumps([row._asdict() for row in rows]),
+)
+
 # ------------------------------------------------------------- endpoints
 
 # A base URL's host says who bills what it serves: a provider's own host or

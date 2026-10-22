@@ -1166,9 +1166,10 @@ def scan_opencode(providers: Iterable[str], accept: Accept) -> tuple[list[UsageR
   # provider took it, by (session, parentID).
   firsts: dict[tuple[str, str], str] = {}
 
-  def take(message_id: Any, session_id: Any, raw: Any, row_type: str, created: Any, since: Any = None, turn: Any = "", empty: bool = False) -> None:
+  def take(message_id: Any, session_id: Any, raw: Any, row_type: str, created: Any, since: Any = None, turn: Any = "", empty: bool = False, typed: str | None = None) -> None:
     # `turn` is the prompt the row answers, None for none, or "" to read it
-    # from the row; `empty` keeps a row that spent nothing, for that prompt.
+    # from the row; `empty` keeps a row that spent nothing, for that prompt,
+    # dated `typed`, the day it was typed (None when that can't be trusted).
     # One row that still fails must not take the scan down with it.
     try:
       entry = json.loads(raw)
@@ -1183,6 +1184,11 @@ def scan_opencode(providers: Iterable[str], accept: Accept) -> tuple[list[UsageR
     if row is None or str(message_id) in seen:
       return
     seen.add(str(message_id))
+    if empty and not (row.input_tokens or row.output_tokens or row.cache_read or row.cache_write):
+      # A failed reply is only its prompt, which counts on its own day.
+      if typed is None:
+        return
+      row = row._replace(day=typed)
     if turn == "":
       # The original store's steps name the user message they answer; a
       # compaction's summary answers the marker opencode adds, no prompt.
@@ -1220,17 +1226,21 @@ def scan_opencode(providers: Iterable[str], accept: Accept) -> tuple[list[UsageR
       # and spent nothing too; `synthetic` rows are the ones opencode adds
       # itself. A session without any keeps a prompt per reply.
       asked: set[str] = set()
-      replies: set[str] = set()
+      # Each reply booking a prompt, and the day its first user row was typed.
+      replies: dict[str, str | None] = {}
       order = "seq" if "seq" in columns else "time_created" if "time_created" in columns else ""
       if order:
-        for session_id, reply_id in conn.execute(
+        for session_id, reply_id, created_at, typed_at in conn.execute(
           "SELECT u.session_id, (SELECT a.id FROM session_message a WHERE a.session_id = u.session_id AND a.type = 'assistant'"
-          f" AND (a.{order} > u.{order} OR (a.{order} = u.{order} AND a.id > u.id)) ORDER BY a.{order}, a.id LIMIT 1)"
-          " FROM session_message u WHERE u.type = 'user'"
+          f" AND (a.{order} > u.{order} OR (a.{order} = u.{order} AND a.id > u.id)) ORDER BY a.{order}, a.id LIMIT 1),"
+          " CASE WHEN json_valid(u.data) THEN json_extract(u.data, '$.time.created') END,"
+          f" {'u.time_created' if 'time_created' in columns else 'NULL'}"
+          f" FROM session_message u WHERE u.type = 'user' ORDER BY u.{order}, u.id"
         ):
           asked.add(str(session_id))
-          if reply_id is not None:
-            replies.add(str(reply_id))
+          if reply_id is not None and str(reply_id) not in replies:
+            # The user row's own time, else the row's, as _opencode_row reads it.
+            replies[str(reply_id)] = local_day(typed_at if created_at is None else created_at)
       created = "m.time_created" if "time_created" in columns else "NULL"
       source = "session_message m"
       fork_filter = ""
@@ -1249,7 +1259,7 @@ def scan_opencode(providers: Iterable[str], accept: Accept) -> tuple[list[UsageR
           turn = None
         else:
           turn = ("message", str(message_id))
-        take(message_id, session_id, raw, str(row_type or ""), time_created, turn=turn, empty=turn is not None and str(session_id) in asked)
+        take(message_id, session_id, raw, str(row_type or ""), time_created, turn=turn, empty=turn is not None and str(session_id) in asked, typed=replies.get(str(message_id)))
     columns = _table_columns(conn, "message") if "message" in tables else set()
     if {"session_id", "data"} <= columns and patterns:
       row_id = "m.id" if "id" in columns else "m.rowid"
