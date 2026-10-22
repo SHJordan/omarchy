@@ -211,4 +211,21 @@ expect("once that line is whole and more follow, it still counts once",
 # The same totals whichever way the collectors got there.
 resumed = sorted(collectors.scan_codex_routed("zai")[0])
 expect("Z.ai's Codex rows are the same read on as read whole", resumed, sorted(collectors.scan_codex_routed("zai", reuse=False)[0]))
+
+# A guardian thread counts under the session that started it, as Codex 0.160
+# writes one: its session_id and parent_thread_id name the thread it checks.
+GUARDIAN = "01a1284c-6fa4-7c13-8d29-e2d8b566ae36"
+guardian = sessions / f"rollout-2026-10-22T12-05-00-{GUARDIAN}.jsonl"
+guardian_meta = meta("zai")
+guardian_meta["payload"].update({"id": GUARDIAN, "parent_thread_id": THREAD, "originator": "codex-tui",
+  "source": {"subagent": {"other": "guardian"}}, "thread_source": "guardian_review"})
+guardian.write_text(lines(guardian_meta, turn_context(1, "codex-auto-review"), response(2, "resp_g1", FIRST, FIRST)))
+rows = collectors.scan_codex_routed("zai")[0]
+expect("a guardian thread's rows count under the session it checks",
+  sorted({row.session for row in rows if row.model == "codex-auto-review"}), [THREAD])
+# Every Z.ai rollout here belongs to that one thread, so it is one session.
+stats = collectors.Stats()
+for row in rows:
+  stats.add_row(row, row.model)
+expect("so Z.ai counts one session, not one per rollout file", stats.snapshot()["totalSessions"], 1)
 PY

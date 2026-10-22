@@ -177,7 +177,8 @@ expect("Local still prints its record when the cache can't be written", models(r
 # model that answered it even when a legacy rollout writes it before the
 # turn_context: a tool call's two requests are one prompt, Codex's own context
 # and a subagent's messages are none, and a cloud model's prompt is no more
-# local than its tokens.
+# local than its tokens. A subagent naming no thread that started it starts no
+# session of its own either.
 use_home()
 rollout("paginated", meta("ollama"), context("qwen-tools"), typed("run ls"), token_count(1000),
         {"timestamp": STAMP, "type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "CommandExecution", "id": "c1"}}},
@@ -190,7 +191,7 @@ rollout("subagent", {"timestamp": STAMP, "type": "session_meta", "payload": {"mo
 record = local()
 expect("Local counts the prompts typed, under the model that answered them", {
   "prompts": record["todayPrompts"], "sessions": record["totalSessions"], "models": models(record), "ready": record["ready"],
-}, {"prompts": 2, "sessions": 3, "models": ["qwen-legacy", "qwen-review", "qwen-tools"], "ready": True}, record)
+}, {"prompts": 2, "sessions": 2, "models": ["qwen-legacy", "qwen-review", "qwen-tools"], "ready": True}, record)
 
 # A rollout records its provider's id, never the URL it reached, so a custom
 # provider's endpoint is remembered from config.toml: its history stays local

@@ -2143,9 +2143,10 @@ CODEX_WINDOW_DAYS = 30
 # Per-file totals of Codex rollouts survive between runs, so a rescan only
 # reads the files that changed. Bumping it retires every older record; version
 # 2 drops totals cached while an untrusted time still counted on the file's day,
-# version 3 those that counted every request as a prompt, and version 4 those
-# that missed the responses only Codex 0.163's token_usage_record lines name.
-CODEX_ROLLOUT_SCHEMA = 4
+# version 3 those that counted every request as a prompt, version 4 those
+# that missed the responses only Codex 0.163's token_usage_record lines name,
+# and version 5 those with no session.
+CODEX_ROLLOUT_SCHEMA = 5
 
 _CODEX_MARKERS = ('"token_count"', '"token_usage_record"', '"turn_context"', '"session_meta"', '"user_message"', '"UserMessage"')
 
@@ -2168,6 +2169,7 @@ def _codex_record_valid(value: Any) -> bool:
     counts = [totals for models in value["days"].values() for totals in models.values()]
     return (
       type(value["mtime"]) in (int, float) and type(value["size"]) is int and isinstance(value["provider"], str)
+      and (value["session"] is None or type(value["session"]) is str)
       and all(len(totals) == 5 and all(type(n) is int for n in totals) for totals in counts)
     )
   except Exception:
@@ -2187,9 +2189,28 @@ def _codex_typed_prompt(entry: dict[str, Any]) -> bool:
 
 
 def _codex_typed_session(meta: dict[str, Any]) -> bool:
-  # A subagent's or Codex's own internal thread is prompted by Codex itself.
+  # A subagent's thread, or one of Codex's own (a guardian review, memory
+  # consolidation), is prompted by Codex, not by anyone typing: its requests
+  # still spend tokens, but its messages are no prompts.
   source = meta.get("source")
   return not (isinstance(source, dict) and ("subagent" in source or "internal" in source))
+
+
+def codex_rollout_session(meta: dict[str, Any], typed: bool, path: Any) -> str | None:
+  """The session a rollout's tokens count under. A thread someone started is
+  its own, by its thread id. Codex's own threads (a review, a guardian check,
+  a spawned agent) name the root thread that started them in session_id, or
+  their parent in parent_thread_id, and count under it, as a Claude Code
+  sidechain counts under its parent's sessionId: they spend tokens but start
+  no session. One that names no thread but its own, such as a memory
+  consolidation, counts under none."""
+  thread = meta.get("id")
+  if typed:
+    return str(thread or path)
+  for starter in (meta.get("session_id"), meta.get("parent_thread_id")):
+    if starter and starter != thread:
+      return str(starter)
+  return None
 
 
 # A rollout that only grew is read on from where the last read stopped,
@@ -2251,9 +2272,10 @@ def _codex_resume(handle: Any, previous: dict[str, Any]) -> dict[str, Any] | Non
 
 
 def read_codex_rollout(path: Path, stat_result: os.stat_result, previous: dict[str, Any] | None = None) -> dict[str, Any]:
-  """One rollout's provider and day -> model -> [input, output, cacheRead,
-  cacheWrite, prompts], counted the way the Codex collector counts its own.
-  A rollout on the built-in provider, or naming none, is left unread.
+  """One rollout's provider, session (codex_rollout_session) and day ->
+  model -> [input, output, cacheRead, cacheWrite, prompts], counted the way
+  the Codex collector counts its own. A rollout on the built-in provider, or
+  naming none, is left unread.
 
   A prompt counts on its own day, under the model that answered it: the one
   in effect at the next request, since a legacy rollout can write the prompt
@@ -2265,7 +2287,7 @@ def read_codex_rollout(path: Path, stat_result: os.stat_result, previous: dict[s
   rollout dated by its mtime, or ending in a line still being written, is
   read whole next time.
   """
-  record: dict[str, Any] = {"mtime": stat_result.st_mtime, "size": stat_result.st_size, "provider": "", "days": {}}
+  record: dict[str, Any] = {"mtime": stat_result.st_mtime, "size": stat_result.st_size, "provider": "", "session": str(path), "days": {}}
   current_model = "local"
   seen_meta = False
   typed = True
@@ -2290,6 +2312,7 @@ def read_codex_rollout(path: Path, stat_result: os.stat_result, previous: dict[s
       state = _codex_resume(handle, previous) if previous else None
       if previous and state is not None:
         record["provider"] = previous["provider"]
+        record["session"] = previous["session"]
         record["days"] = state["days"]
         current_model = state["model"]
         seen_meta = state["meta"]
@@ -2328,13 +2351,15 @@ def read_codex_rollout(path: Path, stat_result: os.stat_result, previous: dict[s
             if seen_meta:
               continue
             seen_meta = True
-            record["provider"] = str(obj(entry.get("payload")).get("model_provider") or "").strip().lower()
+            meta = obj(entry.get("payload"))
+            record["provider"] = str(meta.get("model_provider") or "").strip().lower()
             # The built-in provider, or none recorded, is the Codex
             # collector's: nothing here can count it.
             if record["provider"] in ("", CODEX_NATIVE_PROVIDER):
               done = True
               break
-            typed = _codex_typed_session(obj(entry.get("payload")))
+            typed = _codex_typed_session(meta)
+            record["session"] = codex_rollout_session(meta, typed, path)
             continue
           if not seen_meta:
             continue
@@ -2615,8 +2640,8 @@ def scan_codex_routed(owner: str, reuse: bool = True) -> tuple[list[UsageRow], b
     return [], True
   records, complete = codex_rollouts(codex_rollout_cache(), reuse=reuse)
   rows = [
-    UsageRow(day, key, owner, model, *totals[:4], prompts=totals[4])
-    for key, record in records.items()
+    UsageRow(day, record["session"], owner, model, *totals[:4], prompts=totals[4])
+    for record in records.values()
     for day, models in record["days"].items()
     for model, totals in models.items()
     if codex_route_owner(record["provider"], model, urls) == owner
