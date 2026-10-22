@@ -2566,6 +2566,21 @@ def read_codex_rollout(path: Path, stat_result: os.stat_result, previous: dict[s
   return record
 
 
+# How long a refresh's start, as omarchy-agent-usage-update hands it to the
+# collectors it runs, speaks for a forced read: longer than any refresh takes,
+# so a stamp inherited from elsewhere soon stops standing in for --force.
+CODEX_REFRESH_SECONDS = 300
+
+
+def _codex_refresh_started(now: float) -> float:
+  """When the refresh this collector runs in began, or `now` outside one."""
+  try:
+    started = float(os.environ.get("OMARCHY_AGENT_USAGE_REFRESH_AT", ""))
+  except ValueError:
+    return now
+  return started if now - CODEX_REFRESH_SECONDS <= started <= now else now
+
+
 def codex_rollout_cache(agent_id: str | None = None) -> Path | None:
   """Where the Codex rollout records of this Codex home are kept, or None
   when the cache root is unusable: that costs the reuse, never the scan.
@@ -2588,8 +2603,9 @@ def codex_rollouts(cache_file: Path | None, reuse: bool = True, native: bool = F
   Rollouts are append-only, so a file whose mtime and size both match its
   cached record cannot have grown a turn since, and one that grew is read on
   from where its record stopped; `reuse=False` reads them all again, but
-  takes what another forced read wrote while it ran, so the collectors one
-  refresh forces read every rollout once between them. A
+  takes what another forced read wrote since this one or its refresh
+  (OMARCHY_AGENT_USAGE_REFRESH_AT) began, so the collectors one refresh
+  forces read every rollout once between them, whenever each starts. A
   record keeps every turn whatever its provider, so the caller decides which
   providers and models are its own, and every caller shares the cache
   codex_rollout_cache() names: any `cache_file` stands for it, and None
@@ -2617,7 +2633,7 @@ def codex_rollouts(cache_file: Path | None, reuse: bool = True, native: bool = F
           found.append((str(path), path, stat_result))
     return found
 
-  started = time.time()
+  started = _codex_refresh_started(time.time())
   # When a forced read last wrote the cache: every record in it was read
   # afresh since, replayed from that read or read since.
   forced_at: list[float | None] = [None]
@@ -2634,8 +2650,8 @@ def codex_rollouts(cache_file: Path | None, reuse: bool = True, native: bool = F
       return {}
     stamp = payload.get("forcedAt")
     stamp = stamp if type(stamp) in (int, float) else None
-    # A forced read reuses only what another forced read wrote while this one
-    # ran, so a refresh rereads every rollout once, whichever collector gets
+    # A forced read reuses only what another forced read of the same refresh
+    # wrote, so a refresh rereads every rollout once, whichever collector gets
     # to the lock first, and never replays an older cache.
     if not reuse and (stamp is None or stamp < started):
       return {}
