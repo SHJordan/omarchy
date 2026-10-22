@@ -194,4 +194,22 @@ for provider, want in (("busy", (2000, 20)), ("late", (100, 1))):
   check(f"a fork whose parent was deleted is read in full for {provider}",
         complete and (sum(row.input_tokens for row in rows), sum(row.prompts for row in rows)) == want,
         json.dumps({"complete": complete, "rows": [row._asdict() for row in rows]}))
+
+# Two forks of that deleted session copied its last prompt, still
+# unanswered, and answered it on different providers: the gone parent still
+# ties them, so the prompt counts once, under one collector.
+siblings = work / "siblings"
+copied = [{"type": "model_change", "id": "sm", "timestamp": stamp, "provider": "busy", "modelId": "busy-model"},
+          {"type": "message", "id": "sq", "timestamp": stamp, "message": {"role": "user", "content": "go", "timestamp": 1}}]
+for name, provider in (("a", "alpha"), ("b", "beta")):
+  write(siblings / f"fork-{name}.jsonl", [{"type": "session", "version": 3, "id": f"s{name}", "timestamp": stamp, "cwd": "/proj", "parentSession": str(siblings / "deleted.jsonl")},
+                                         *copied, {"type": "model_change", "id": f"sc{name}", "timestamp": stamp, "provider": provider, "modelId": f"{provider}-model"},
+                                         {"type": "message", "id": f"sr{name}", "timestamp": stamp, "message": {"role": "assistant", "provider": provider, "model": f"{provider}-model", "usage": usage(100), "timestamp": 2}}])
+prompts, completes = 0, []
+for provider in ("alpha", "beta"):
+  rows, complete = collectors.scan_pi_sessions(r'"provider"\s*:\s*"' + provider + '"', lambda name, model, entry, provider=provider: name == provider, roots=[siblings])
+  prompts += sum(row.prompts for row in rows)
+  completes.append(complete)
+check("a prompt two forks of a deleted session copied and answered on different providers counts once",
+      all(completes) and prompts == 1, json.dumps({"prompts": prompts, "complete": completes}))
 PY

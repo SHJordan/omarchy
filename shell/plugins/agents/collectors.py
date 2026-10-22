@@ -692,10 +692,10 @@ def pi_parent_session(path: str) -> str | None:
   parent = header.get("parentSession") if isinstance(header, dict) else None
   if not isinstance(parent, str) or not parent:
     return None
-  parent = os.path.realpath(os.path.expanduser(parent))
-  # pi deletes a session from /resume, leaving its forks naming it: a parent
-  # that is gone, or no regular file, is none, and the fork keeps its copies.
-  return parent if os.path.isfile(parent) else None
+  # pi deletes a session from /resume, leaving its forks naming it. A parent
+  # that is gone still ties its forks together, so a prompt they both copied
+  # counts once; only reading it is skipped.
+  return os.path.realpath(os.path.expanduser(parent))
 
 
 def _rg_text(field: Any) -> str:
@@ -1074,7 +1074,7 @@ def scan_pi_sessions(pattern: str, accept: Accept, roots: Iterable[Path] | None 
       continue
     family.add(path)
     queue.extend(ancestors(path) | set(children.get(path, ())))
-  others = sorted(os.fsencode(path) for path in family - read if any(Path(path).is_relative_to(root) for root in roots))
+  others = sorted(os.fsencode(path) for path in family - read if os.path.isfile(path) and any(Path(path).is_relative_to(root) for root in roots))
   if others and all(re.fullmatch(r"[A-Za-z0-9_.:-]+", key) for key in ids):
     # Such an id is written as itself, quoted, so a file holding none of
     # them quoted holds no copy, and is never parsed.
