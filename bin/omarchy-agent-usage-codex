@@ -85,9 +85,10 @@ TRANSPORT_ERRORS = (
 # the way every collector reads them, and version 3 drops totals cached while a
 # falsy time still counted on the file's day, version 4 counts typed prompts
 # apart from the requests that answered them, version 5 counts Codex 0.163's
-# token_usage_record lines, and version 6 books a subagent's thread under the
-# session that started it.
-FILE_CACHE_SCHEMA = 6
+# token_usage_record lines, version 6 books a subagent's thread under the
+# session that started it, and version 7 keeps each prompt under the model
+# that answered it.
+FILE_CACHE_SCHEMA = 7
 
 
 
@@ -157,8 +158,8 @@ STATS = Stats()
 
 
 # One session file's totals, the unit the file cache stores: day -> model ->
-# [input, output, cacheRead, cacheWrite], and day -> the prompts typed that
-# day. Day-keyed and with no "today" in it, so a record stays true however long
+# [input, output, cacheRead, cacheWrite], and day -> model -> the prompts
+# typed that day that model answered. Day-keyed and with no "today" in it, so a record stays true however long
 # it is kept.
 # "session" is the thread a person started, or None for a thread nothing
 # names a starter for.
@@ -174,6 +175,11 @@ def record_usage(record, day, model, input_tokens, output_tokens, cache_read, ca
   totals[3] += cache_write
 
 
+def record_prompt(record, day, model):
+  models = record["prompts"].setdefault(day, {})
+  models[model] = models.get(model, 0) + 1
+
+
 def merge_file_record(record, urls):
   """Fold one file's totals, freshly read or replayed from cache, into the run:
   each day and model's tokens at once, and the prompts typed each day. One
@@ -181,19 +187,24 @@ def merge_file_record(record, urls):
   count no prompts of their own.
 
   While openai_base_url sends the built-in provider elsewhere, the models
-  codex_route_owner() gives another collector are left to it, and a rollout
-  none of whose models stay here takes its prompts along."""
+  codex_route_owner() gives another collector are left to it, each with the
+  prompts it answered, as that collector books them."""
   session_key = record["session"]
-  owners = {model: codex_route_owner(NATIVE_PROVIDER, model, urls) for models in record["days"].values() for model in models}
+  owners = {}
+
+  def ours(model):
+    if model not in owners:
+      owners[model] = codex_route_owner(NATIVE_PROVIDER, model, urls) == AGENT_ID
+    return owners[model]
+
   for day, models in record["days"].items():
     for model, (input_tokens, output_tokens, cache_read, cache_write) in models.items():
-      if owners[model] == AGENT_ID:
+      if ours(model):
         STATS.add(day, session_key, model, input_tokens, output_tokens, cache_read, cache_write, prompts=0)
-  # A prompt nothing answered was put to Codex's own model.
-  if AGENT_ID not in (set(owners.values()) or {codex_route_owner(NATIVE_PROVIDER, None, urls)}):
-    return
-  for day, prompts in record["prompts"].items():
-    STATS.add_prompts(day, session_key, prompts)
+  for day, models in record["prompts"].items():
+    for model, prompts in models.items():
+      if ours(model):
+        STATS.add_prompts(day, session_key, prompts)
 
 
 def typed_prompt(entry):
@@ -303,6 +314,10 @@ def read_native_codex_session(path, stat_result):
   current_model = "codex"
   seen_meta = False
   typed = True
+  # The days of the prompts typed since the last request, which go with the
+  # model that answers them: a legacy rollout can write a prompt before the
+  # turn_context naming its model.
+  pending_prompts = []
   previous_total_usage = None
   # Codex 0.163 writes a token_usage_record for every response it is billed
   # for, a compaction's included, where token_count only follows a sampling
@@ -353,7 +368,7 @@ def read_native_codex_session(path, stat_result):
           stamped = entry.get("timestamp")
           day = local_day(stat_result.st_mtime if stamped is None else stamped)
           if typed and day is not None:
-            record["prompts"][day] = record["prompts"].get(day, 0) + 1
+            pending_prompts.append(day)
           continue
         if entry.get("type") == "turn_context":
           payload = obj(entry.get("payload"))
@@ -410,10 +425,18 @@ def read_native_codex_session(path, stat_result):
         if day is None:
           continue
         record_usage(record, day, current_model, input_tokens, output_tokens, cache_read, cache_write)
+        # One prompt can take many requests, one per tool call it makes; the
+        # first one after it says which model answered it.
+        for prompt_day in pending_prompts:
+          record_prompt(record, prompt_day, current_model)
+        pending_prompts = []
   except Exception:
     # Keep what was read before the failure, but caching a partial record would
     # hide the rest until the file changes, so hand back one the cache refuses.
     record["mtime"] = None
+  # A prompt no request answered was put to the model the rollout was set to.
+  for prompt_day in pending_prompts:
+    record_prompt(record, prompt_day, current_model)
   return record
 
 
@@ -442,7 +465,7 @@ def valid_file_record(value):
       type(value["mtime"]) in (int, float) and type(value["size"]) is int
       and (value["session"] is None or type(value["session"]) is str)
       and all(len(totals) == 4 and all(type(n) is int for n in totals) for totals in counts)
-      and all(type(n) is int for n in value["prompts"].values())
+      and all(type(n) is int for models in value["prompts"].values() for n in models.values())
     )
   except Exception:
     return False

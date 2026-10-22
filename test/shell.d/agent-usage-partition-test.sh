@@ -2403,3 +2403,66 @@ if [[ -z $prefix_report ]]; then
 else
   fail "local leaves a configured kimchi-dev/<upstream> id to the kimchi collector" "$prefix_report"
 fi
+
+# ------------------------------- A Codex rollout switching models mid-thread
+
+# Behind a self-hosted openai_base_url, one built-in rollout can switch from
+# an OpenAI model to a local one between turns (`/model`). Each typed prompt
+# goes with the model that answered it, so codex books the first and local
+# the second, and neither books the other's.
+CODEX_MIXED_HOME="$WORK/codex-mixed-models"
+mkdir -p "$CODEX_MIXED_HOME/.codex"
+printf 'openai_base_url = "http://127.0.0.1:18495/v1"\n' >"$CODEX_MIXED_HOME/.codex/config.toml"
+python3 - "$CODEX_MIXED_HOME" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+home = Path(sys.argv[1])
+stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+rollouts = home / ".codex/sessions" / datetime.now().strftime("%Y/%m/%d")
+rollouts.mkdir(parents=True)
+thread = "01a164b2-4c11-7a20-9d31-5e6f7a8b0950"
+lines = [{"timestamp": stamp, "ordinal": 0, "type": "session_meta", "payload": {"session_id": thread, "id": thread, "cli_version": "0.163.0", "history_mode": "paginated", "originator": "codex-tui", "source": "cli", "thread_source": "user", "model_provider": "openai"}}]
+total = {"input_tokens": 0, "cached_input_tokens": 0, "cache_write_input_tokens": 0, "output_tokens": 0, "reasoning_output_tokens": 0, "total_tokens": 0}
+for n, model in enumerate(("gpt-5.1-codex-zm950", "qwen3-coder-zm951")):
+  turn = f"01a164b2-4c8b-71f1-b648-20be1fa2{n:04d}"
+  usage = {"input_tokens": 12234 + n, "cached_input_tokens": 71, "cache_write_input_tokens": 31, "output_tokens": 51, "reasoning_output_tokens": 0, "total_tokens": 12285 + n}
+  total = {key: total[key] + usage[key] for key in total}
+  item = {"type": "UserMessage", "id": f"01a164b2-4d01-7231-a532-dda74a01{n:04d}", "content": [{"type": "text", "text": "go", "text_elements": []}]}
+  lines += [
+    {"timestamp": stamp, "ordinal": 10 * n + 1, "type": "turn_context", "payload": {"model": model, "turn_id": turn}},
+    {"timestamp": stamp, "ordinal": 10 * n + 2, "type": "event_msg", "payload": {"type": "item_completed", "thread_id": thread, "turn_id": turn, "item": item}},
+    {"timestamp": stamp, "ordinal": 10 * n + 3, "type": "token_usage_record", "payload": {"thread_id": thread, "turn_id": turn, "session_id": thread, "response_id": f"resp_zm_{n:04d}", "usage": usage, "turn_token_usage": usage, "thread_token_usage": total}},
+    {"timestamp": stamp, "ordinal": 10 * n + 4, "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": total, "last_token_usage": usage, "model_context_window": 258400}}},
+  ]
+(rollouts / f"rollout-2026-10-22T14-02-11-{thread}.jsonl").write_text("".join(json.dumps(line) + "\n" for line in lines))
+PY
+run_collector "$CODEX_MIXED_HOME" codex "$WORK/codex-mixed-codex"
+run_collector "$CODEX_MIXED_HOME" local "$WORK/codex-mixed-local"
+codex_mixed_report=$(python3 - "$WORK/codex-mixed-codex.json" "$WORK/codex-mixed-local.json" <<'PY'
+import json
+import sys
+
+problems = []
+for path, model in zip(sys.argv[1:], ("gpt-5.1-codex-zm950", "qwen3-coder-zm951")):
+  name = path.rsplit("/", 1)[-1]
+  try:
+    record = json.load(open(path))
+  except (OSError, ValueError) as error:
+    problems.append(f"{name} is unreadable: {error}")
+    continue
+  models = set(record.get("todayTokensByModel") or {})
+  if models != {model}:
+    problems.append(f"{name} counts {sorted(models)}, expected {[model]}")
+  if (record.get("totalPrompts"), record.get("totalSessions")) != (1, 1):
+    problems.append(f"{name} counted prompts and sessions {(record.get('totalPrompts'), record.get('totalSessions'))}, expected (1, 1)")
+print("\n".join(problems))
+PY
+)
+if [[ -z $codex_mixed_report ]]; then
+  pass "a Codex rollout switching from an OpenAI model to a local one books each prompt once, with the model that answered it"
+else
+  fail "a Codex rollout switching from an OpenAI model to a local one books each prompt once, with the model that answered it" "$codex_mixed_report"
+fi
