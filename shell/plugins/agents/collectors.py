@@ -1313,9 +1313,9 @@ def scan_opencode(providers: Iterable[str], accept: Accept) -> tuple[list[UsageR
 # Some harnesses send to whatever base URL they are given and record only the
 # model that answered, or a route's name: Claude Code fronts any endpoint
 # ANTHROPIC_BASE_URL names, and a MiniMax Code custom provider any baseURL.
-# Z.ai, Ollama, MiniMax, DeepSeek, Kimi, Alibaba's Model Studio, OpenRouter
-# and Synthetic each document pointing them at their own APIs, so the host
-# says whose tokens those turns are.
+# Z.ai, Ollama, MiniMax, DeepSeek, Kimi, Alibaba's Model Studio, OpenRouter,
+# Synthetic and Kimchi each document pointing them at their own APIs, so the
+# host says whose tokens those turns are.
 
 # The hosts a harness is pointed at in place of its own service, by the
 # collector that bills them. A subdomain of one is the same service.
@@ -1338,6 +1338,11 @@ PROVIDER_HOSTS = {
   "openrouter.ai": "openrouter",
   # Synthetic's Anthropic- and OpenAI-compatible APIs (/anthropic, /openai/v1).
   "api.synthetic.new": "synthetic",
+  # Kimchi's gateway in each region (llm.kimchi.dev, llm.eu.kimchi.dev), at
+  # the /anthropic and /openai/v1 routes `kimchi claudecode`, `kimchi codex`
+  # and its opencode setup write. It bills every model it serves, Claude,
+  # Kimi, GLM and MiniMax ones too.
+  "kimchi.dev": "kimchi",
 }
 
 
@@ -1442,8 +1447,10 @@ def claude_code_owner(model: Any, base_url: str = "") -> str | None:
   or None when nothing here can say who billed it.
 
   A transcript doesn't say where it was sent, so while ANTHROPIC_BASE_URL
-  names a provider's host every reply is read as that provider's. Otherwise
-  an Ollama cloud tag is Ollama's, wherever it was sent, and a Claude model
+  names a provider's host every reply is read as that provider's, whatever
+  its model: a Claude or kimi-* reply through Kimchi's gateway is Kimchi's,
+  never Anthropic's or Kimi's. Otherwise an Ollama cloud tag is Ollama's,
+  wherever it was sent, and a Claude model
   is Anthropic's, through a proxy that may forward to it too. Behind a
   self-hosted base URL anything else ran on the user's own hardware. With no
   override the model's name says whose it was (glm-* is Z.ai's, MiniMax-*
@@ -2714,8 +2721,10 @@ def kimchi_sessions_root() -> Path:
   """Where Kimchi's harness keeps its pi-format sessions: under
   KIMCHI_CODING_AGENT_DIR when set, as the CLI itself reads it, else
   ~/.config/kimchi/harness. Kimchi has no profiles that move it. Its own
-  gateway routes are the kimchi collector's; a session `--provider` sent
-  elsewhere (OpenRouter) is that provider's."""
+  gateway routes (kimchi, kimchi-dev, kimchi-dev/<upstream>,
+  kimchi-experimental) are the kimchi collector's here and in pi's and omp's
+  trees alike; a session `--provider` sent elsewhere (OpenRouter) is that
+  provider's."""
   return Path(os.environ.get("KIMCHI_CODING_AGENT_DIR") or (Path.home() / ".config" / "kimchi" / "harness")) / "sessions"
 
 

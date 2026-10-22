@@ -1907,3 +1907,130 @@ if [[ -z $codex_native_report ]]; then
 else
   fail "Codex's built-in provider counts where openai_base_url sends it, and a guardian thread under its parent's session" "$codex_native_report"
 fi
+
+# Kimchi's gateway bills what reaches it through any agent, so its usage is
+# Kimchi's alone: pi and omp sessions on its provider ids (kimchi, kimchi-dev,
+# kimchi-dev/<upstream>, kimchi-experimental) in pi's and omp's trees and its
+# own harness, opencode's `kimchi` provider, and the Claude Code and Codex
+# setups `kimchi claudecode` and `kimchi codex` write, sent to llm.kimchi.dev
+# and llm.eu.kimchi.dev. Model names that would otherwise say Kimi, Z.ai,
+# MiniMax, DeepSeek or Anthropic never take a turn the gateway served, and a
+# lookalike id (kimchi-proxy) counts nowhere.
+KIMCHI_HOME="$WORK/kimchi-gateway"
+python3 - "$KIMCHI_HOME" <<'PY'
+import json
+import sqlite3
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+home = Path(sys.argv[1])
+stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+now_ms = int(time.time() * 1000) - 1000
+
+
+def write(path, lines):
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+
+# pi 1.4.0 and omp 18.12.6 lines: a model switch, a typed prompt, its reply.
+def pi_session(path, provider, model, tokens, omp=False):
+  switch = {"type": "model_change", "id": "m0", "parentId": None, "timestamp": stamp}
+  switch.update({"runtime": {"version": "18.12.6"}, "model": f"{provider}/{model}"} if omp else {"provider": provider, "modelId": model})
+  user = {"role": "user", "content": [{"type": "text", "text": "Say hi"}], "timestamp": now_ms}
+  if omp:
+    user["attribution"] = "user"
+  write(path, [
+    {"type": "session", "version": 3, "id": path.stem, "timestamp": stamp, "cwd": "/home/me"},
+    switch,
+    {"type": "message", "id": f"u-{path.stem}", "parentId": "m0", "timestamp": stamp, "message": user},
+    {"type": "message", "id": f"a-{path.stem}", "parentId": f"u-{path.stem}", "timestamp": stamp, "message": {
+      "role": "assistant", "content": [{"type": "text", "text": "hi"}], "api": "openai-completions", "provider": provider, "model": model,
+      "usage": {"input": tokens, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": tokens}, "stopReason": "stop", "timestamp": now_ms}},
+  ])
+
+
+pi = home / ".pi/agent/sessions/--home-me--"
+omp = home / ".omp/agent/sessions/-"
+harness = home / ".config/kimchi/harness/sessions/--home-me--"
+pi_session(pi / "pi-kimchi.jsonl", "kimchi", "zqk01-minimax-m3", 101)
+pi_session(pi / "pi-kimchi-dev.jsonl", "kimchi-dev", "zqk02-kimi-k2.6", 102)
+pi_session(pi / "pi-lookalike.jsonl", "kimchi-proxy", "zqk00-glm-5", 999)
+pi_session(omp / "omp-kimchi.jsonl", "kimchi", "zqk03-kimi-k2.5", 103, omp=True)
+pi_session(omp / "omp-upstream.jsonl", "kimchi-dev/zai", "zqk04-glm-5.2", 104, omp=True)
+pi_session(omp / "omp-experimental.jsonl", "kimchi-experimental", "zqk05-deepseek-v4", 105, omp=True)
+pi_session(harness / "harness-kimchi.jsonl", "kimchi", "zqk06-glm-5.2", 106)
+
+# opencode 1.19.3 rows on the provider Kimchi's opencode setup adds.
+db = home / ".local/share/opencode/opencode.db"
+db.parent.mkdir(parents=True)
+conn = sqlite3.connect(db)
+conn.execute("CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)")
+user = {"role": "user", "time": {"created": now_ms}, "agent": "build", "model": {"providerID": "kimchi", "modelID": "zqk07-minimax-m3"}}
+reply = {"parentID": "msg_k_u", "role": "assistant", "mode": "build", "agent": "build", "cost": 0, "modelID": "zqk07-minimax-m3", "providerID": "kimchi",
+         "tokens": {"total": 107, "input": 107, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}, "time": {"created": now_ms + 1, "completed": now_ms + 2}, "finish": "stop"}
+conn.executemany("INSERT INTO message VALUES (?, ?, ?, ?, ?)", [("msg_k_u", "ses_k", now_ms, now_ms, json.dumps(user)), ("msg_k_a", "ses_k", now_ms + 1, now_ms + 1, json.dumps(reply))])
+conn.commit()
+conn.close()
+
+# Claude Code with the settings.json env `kimchi claudecode` writes, its
+# replies on a Claude model and on models whose names say another provider.
+lines = []
+for n, (model, tokens) in enumerate((("claude-sonnet-4-5-zqk08", 108), ("kimi-k2.6-zqk09", 109), ("glm-5.2-zqk10", 110), ("MiniMax-M3-zqk11", 111), ("deepseek-v4-flash-zqk12", 112))):
+  lines.append({"type": "user", "uuid": f"kc-prompt-{n}", "sessionId": "kc", "timestamp": stamp, "message": {"role": "user", "content": "go"}})
+  lines.append({"type": "assistant", "sessionId": "kc", "timestamp": stamp, "requestId": f"kc-req-{n}",
+                "message": {"id": f"kc-msg-{n}", "role": "assistant", "model": model, "usage": {"input_tokens": tokens, "output_tokens": 0}}})
+write(home / ".claude/projects/project/kc.jsonl", lines)
+(home / ".claude/settings.json").write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://llm.eu.kimchi.dev/anthropic", "ANTHROPIC_API_KEY": ""}}))
+
+# Codex as `kimchi codex` configures it.
+(home / ".codex").mkdir()
+(home / ".codex/config.toml").write_text('model_provider = "kimchi"\nmodel = "zqk13-minimax-m3"\n\n[model_providers.kimchi]\nname = "Kimchi Gateway"\nbase_url = "https://llm.kimchi.dev/openai/v1"\nwire_api = "responses"\n')
+write(home / ".codex/sessions" / datetime.now().strftime("%Y/%m/%d") / "rollout-kimchi.jsonl", [
+  {"timestamp": stamp, "type": "session_meta", "payload": {"model_provider": "kimchi"}},
+  {"timestamp": stamp, "type": "turn_context", "payload": {"model": "zqk13-minimax-m3"}},
+  {"timestamp": stamp, "type": "event_msg", "payload": {"type": "user_message", "message": "go"}},
+  {"timestamp": stamp, "type": "event_msg", "payload": {"type": "token_count", "info": {
+    "last_token_usage": {"input_tokens": 113, "cached_input_tokens": 0, "output_tokens": 0}, "total_token_usage": {"input_tokens": 113}}}},
+])
+PY
+run_all "$KIMCHI_HOME" "$WORK/kimchi-gateway-results"
+
+kimchi_gateway_report=$(python3 - "$WORK/kimchi-gateway-results" "${collectors[@]}" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+results = Path(sys.argv[1])
+# Every zqkNN row once, under kimchi, and zqk00 under nobody: seven pi-format
+# sessions, opencode's, Claude Code's and Codex's, one prompt per reply.
+expected = {f"zqk{n:02d}": 100 + n for n in range(1, 14)}
+seen = {}
+for cid in sys.argv[2:]:
+  try:
+    record = json.loads((results / f"{cid}.json").read_text())
+  except ValueError:
+    print(f"{cid} printed no JSON record")
+    continue
+  for model, tokens in (record.get("todayTokensByModel") or {}).items():
+    tag = re.search(r"zqk\d\d", model)
+    if tag:
+      seen.setdefault(tag.group(0), []).append((cid, tokens))
+  if cid != "kimchi" and record.get("todayPrompts"):
+    print(f"{cid} counted {record['todayPrompts']} of Kimchi's prompts")
+  if cid == "kimchi" and (record.get("todayPrompts"), record.get("todaySessions")) != (13, 9):
+    print(f"kimchi: prompts and sessions {(record.get('todayPrompts'), record.get('todaySessions'))}, expected (13, 9)")
+for tag in sorted(set(expected) | set(seen)):
+  want = [("kimchi", expected[tag])] if tag in expected else []
+  if seen.get(tag, []) != want:
+    print(f"{tag}: counted {seen.get(tag, [])}, expected {want}")
+PY
+)
+if [[ -z $kimchi_gateway_report ]]; then
+  pass "usage Kimchi's gateway billed through pi, omp, opencode, Claude Code or Codex counts once, under kimchi"
+else
+  fail "usage Kimchi's gateway billed through pi, omp, opencode, Claude Code or Codex counts once, under kimchi" "$kimchi_gateway_report"
+fi
