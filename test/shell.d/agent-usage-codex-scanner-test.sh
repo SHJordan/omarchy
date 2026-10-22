@@ -628,6 +628,23 @@ expect("Codex explains a failed app-server in its own words", {
   "chatty": True,
 }, help_texts)
 
+# ------------------------------------------------ openai_base_url's owner
+
+# A built-in rollout answered by a model not OpenAI's is Codex's on OpenAI's
+# API and nobody's behind a gateway nothing can place, so switching
+# openai_base_url between the two must not leave a reused scan counting it,
+# as a real rollout with its model renamed showed.
+new_home()
+rollout("rollout-2026-10-22T11-00-00-01a1647f-6fb5-7081-a481-257bbb530940.jsonl",
+        meta(id="01a1647f-6fb5-7081-a481-257bbb530940", originator="codex_exec", source="exec", model_provider="openai", cli_version="0.163.0"),
+        context("qwen3-coder"), typed(), tokens(65105, 3250, cached=566656))
+(home() / ".codex" / "config.toml").write_text('openai_base_url = "https://api.openai.com/v1"\n')
+on_openai = codex("--limits-only")["todayTokensByModel"]
+(home() / ".codex" / "config.toml").write_text('openai_base_url = "https://gateway.example.com/v1"\n')
+on_gateway = codex("--limits-only")["todayTokensByModel"]
+expect("a reused scan stops counting a non-OpenAI model once openai_base_url moves from OpenAI's API to a gateway",
+       ["qwen3-coder" in on_openai, "qwen3-coder" in on_gateway], [True, False], [on_openai, on_gateway])
+
 # ---------------------------------------------------------------- contract
 
 new_home()

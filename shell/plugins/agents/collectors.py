@@ -2729,15 +2729,19 @@ def codex_openai_model(model: Any) -> bool:
   return not name or name.startswith(("gpt-", "chatgpt-")) or "codex" in name or re.fullmatch(r"o[1-9](-.*)?", name) is not None
 
 
-def codex_native_endpoint(urls: dict[str, str]) -> str:
-  """Where openai_base_url sends the built-in provider: "" for OpenAI's own
-  API (no override), a provider collector's id, `local`, or `other` for a
-  host nothing here can place."""
-  base = urls.get(CODEX_NATIVE_PROVIDER, "")
+def codex_native_class(base: Any) -> str:
+  """Where an openai_base_url sends the built-in provider: "" for OpenAI's
+  own API (no override), a provider collector's id, `local`, or `other` for
+  a host nothing here can place."""
   host = url_host(base)
   if not host or host in ("openai.com", "chatgpt.com") or host.endswith((".openai.com", ".chatgpt.com")):
     return ""
   return endpoint_owner(base) or "other"
+
+
+def codex_native_endpoint(urls: dict[str, str]) -> str:
+  """codex_native_class() of the config's openai_base_url."""
+  return codex_native_class(urls.get(CODEX_NATIVE_PROVIDER, ""))
 
 
 def codex_route_owner(provider: Any, model: Any, urls: dict[str, str]) -> str | None:
@@ -2779,8 +2783,11 @@ def codex_route_owner(provider: Any, model: Any, urls: dict[str, str]) -> str | 
 def codex_scan_match() -> dict[str, Any]:
   """For a collector's cached_scan(match=...): which collector each Codex
   provider's base_url bills, which the config can change without a rollout
-  changing."""
-  return {"codexRoutes": [[pid, endpoint_owner(url)] for pid, url in sorted(codex_provider_urls().items())]}
+  changing. The built-in provider's is read as codex_route_owner() reads
+  it, which tells OpenAI's own API from a host nothing can place."""
+  return {"codexRoutes": [
+    [pid, codex_native_class(url) if pid == CODEX_NATIVE_PROVIDER else endpoint_owner(url)] for pid, url in sorted(codex_provider_urls().items())
+  ]}
 
 
 def scan_codex_routed(owner: str, reuse: bool = True) -> tuple[list[UsageRow], bool]:
