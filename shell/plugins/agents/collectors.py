@@ -1317,7 +1317,7 @@ def scan_opencode(providers: Iterable[str], accept: Accept) -> tuple[list[UsageR
         firsts[turn] = str(first_id)
       for message_id, session_id, raw, since in own_steps:
         take(message_id, session_id, raw, "", None, since)
-      # A typed prompt no step answered (its request failed, or none came)
+      # A typed prompt no step answered (its request failed or was cut off)
       # books itself, without tokens, on the model the user row names, the
       # one opencode sent it to. A compaction's marker is answered by its
       # summary, and one in a subagent's session isn't typed.
@@ -1357,8 +1357,11 @@ def scan_opencode(providers: Iterable[str], accept: Accept) -> tuple[list[UsageR
               continue
         for message_id, session_id, entry in waiting:
           key = (session_id, str(message_id))
-          step_id = steps.get(key, str(message_id))
-          if key in compacted or step_id in seen:
+          # opencode writes the step before it sends the request, so a user
+          # row no step names was refused before sending (an unknown model or
+          # provider) and counts nowhere.
+          step_id = steps.get(key)
+          if step_id is None or key in compacted or step_id in seen:
             continue
           try:
             row = _opencode_row(session_id, entry, "user", None, accept, empty=True)

@@ -954,14 +954,16 @@ check(
 # itself without tokens on the model its user row names, so a session
 # holding only that still counts. In V2 it books on the failed reply after
 # it, and a message migrated into both stores books once. A compaction's
-# marker, a subagent's prompt, a fork's copy and an untrusted time book none.
+# marker, a subagent's prompt, a fork's copy and an untrusted time book none,
+# and so does a prompt opencode 1.19.3 refused before sending it (an unknown
+# model or provider): it writes the user row alone, with no step at all.
 failed_db = work / "failed.db"
 conn = sqlite3.connect(failed_db)
 conn.execute("CREATE TABLE session (id text PRIMARY KEY, parent_id text, time_created integer NOT NULL)")
 conn.execute("CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)")
 conn.execute("CREATE TABLE session_message (id text PRIMARY KEY, session_id text NOT NULL, type text NOT NULL,"
              " seq integer NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)")
-conn.executemany("INSERT INTO session VALUES (?, ?, ?)", [("ses_fail", None, fork_ms), ("ses_only", None, fork_ms), ("ses_kid", "ses_fail", fork_ms), ("ses_copy", None, now_ms + 50)])
+conn.executemany("INSERT INTO session VALUES (?, ?, ?)", [("ses_fail", None, fork_ms), ("ses_only", None, fork_ms), ("ses_kid", "ses_fail", fork_ms), ("ses_copy", None, now_ms + 50), ("ses_unsent", None, fork_ms)])
 
 
 def asked(created, provider="demo", **extra):
@@ -981,10 +983,13 @@ conn.executemany("INSERT INTO message VALUES (?, ?, ?, ?, ?)", [
   # A compaction that failed answers its marker all the same.
   ("msg_fu3", "ses_fail", now_ms + 4, now_ms + 4, asked(now_ms + 4)),
   ("msg_fc3", "ses_fail", now_ms + 5, now_ms + 5, refused("msg_fu3", now_ms + 5, mode="compaction", agent="compaction", summary=True)),
-  # A session holding only a refused prompt, and one no reply ever came for.
+  # A session holding only a refused prompt, and one never sent.
   ("msg_ou1", "ses_only", now_ms, now_ms, asked(now_ms)),
   ("msg_oa1", "ses_only", now_ms + 1, now_ms + 1, refused("msg_ou1", now_ms + 1)),
   ("msg_ou2", "ses_only", now_ms + 2, now_ms + 2, asked(now_ms + 2)),
+  # A session holding only a prompt never sent, as `opencode run -m` on an
+  # unknown model leaves it (no `summary` yet).
+  ("msg_nu1", "ses_unsent", now_ms, now_ms, json.dumps({k: v for k, v in json.loads(asked(now_ms)).items() if k != "summary"})),
   # Another provider's, a subagent's, a fork's copy, and an untrusted time.
   ("msg_xu1", "ses_only", now_ms + 3, now_ms + 3, asked(now_ms + 3, provider="other")),
   ("msg_ku1", "ses_kid", now_ms, now_ms, asked(now_ms)),
@@ -1007,8 +1012,8 @@ rows, complete = collectors.scan_opencode(["demo"], accept_demo)
 os.environ.pop("OPENCODE_DB")
 booked = sorted((row.session, row.input_tokens, row.prompts) for row in rows if row.prompts or row.input_tokens)
 check(
-  "an opencode prompt no step answered books once, on its user row's model, its session with it",
-  complete and booked == [("opencode:ses_fail", 0, 1), ("opencode:ses_fail", 900, 1), ("opencode:ses_moved", 0, 1), ("opencode:ses_only", 0, 1), ("opencode:ses_only", 0, 1), ("opencode:ses_v2_fail", 0, 1)],
+  "an opencode prompt no step answered books once, on its user row's model, its session with it, and one never sent nowhere",
+  complete and booked == [("opencode:ses_fail", 0, 1), ("opencode:ses_fail", 900, 1), ("opencode:ses_moved", 0, 1), ("opencode:ses_only", 0, 1), ("opencode:ses_v2_fail", 0, 1)],
   json.dumps([row._asdict() for row in rows]),
 )
 
