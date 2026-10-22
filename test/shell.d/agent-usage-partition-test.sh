@@ -1801,3 +1801,109 @@ if [[ -z $unanswered_report ]]; then
 else
   fail "a prompt no reply answered in pi, omp or opencode counts once, under the model its session was set to use" "$unanswered_report"
 fi
+
+# ------------------------------ Codex's built-in provider and its own threads
+
+# Codex 0.163 sends its built-in `openai` provider wherever config.toml's
+# openai_base_url says (OPENAI_BASE_URL does nothing), and its rollouts still
+# record only `"model_provider":"openai"`. Behind a provider's host every
+# built-in rollout is that provider's; behind a self-hosted URL a model not
+# OpenAI's is local's; behind a host nothing can place it counts nowhere,
+# and OpenAI's own models stay codex's behind either. Dropping the key puts
+# them back under codex. A guardian thread counts under the session that
+# started it, in every collector. The lines are shaped as Codex 0.160 and
+# 0.163 write them.
+CODEX_NATIVE_HOME="$WORK/codex-native-routes"
+mkdir -p "$CODEX_NATIVE_HOME/.codex"
+python3 - "$CODEX_NATIVE_HOME" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+home = Path(sys.argv[1])
+stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+rollouts = home / ".codex/sessions" / datetime.now().strftime("%Y/%m/%d")
+rollouts.mkdir(parents=True)
+
+
+def rollout(tag, thread, meta, model, n, typed=True):
+  usage = {"input_tokens": 9234 + n, "cached_input_tokens": 71, "cache_write_input_tokens": 31, "output_tokens": 51, "reasoning_output_tokens": 0, "total_tokens": 9285 + n}
+  turn = f"01a1647f-6fd1-7341-86cf-b00a9315{n:04d}"
+  item = {"type": "UserMessage", "id": f"01a1647f-7085-7231-a532-dda74a01{n:04d}", "content": [{"type": "text", "text": "go", "text_elements": []}]} if typed else {"type": "Reasoning", "id": f"rs_{n:04d}", "summary_text": [], "raw_content": []}
+  lines = [
+    {"timestamp": stamp, "ordinal": 0, "type": "session_meta", "payload": {"session_id": thread, "id": thread, "cli_version": "0.163.0", "history_mode": "paginated", **meta}},
+    {"timestamp": stamp, "ordinal": 5, "type": "turn_context", "payload": {"model": model, "turn_id": turn}},
+    {"timestamp": stamp, "ordinal": 8, "type": "event_msg", "payload": {"type": "item_completed", "thread_id": thread, "turn_id": turn, "item": item}},
+    {"timestamp": stamp, "ordinal": 10, "type": "token_usage_record", "payload": {"thread_id": thread, "turn_id": turn, "session_id": meta.get("session_id", thread), "response_id": f"resp_zo_{n:04d}", "usage": usage, "turn_token_usage": usage, "thread_token_usage": usage}},
+    {"timestamp": stamp, "ordinal": 13, "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": usage, "last_token_usage": usage, "model_context_window": 258400}}},
+  ]
+  (rollouts / f"rollout-{tag}-{thread}.jsonl").write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+
+exec_meta = {"originator": "codex_exec", "source": "exec", "thread_source": "user", "model_provider": "openai"}
+rollout("zo920", "01a1647f-6fb5-7081-a481-257bbb530920", exec_meta, "hf:zai-org/GLM-4.6-zo920", 0)
+rollout("zo921", "01a1647f-6fb5-7081-a481-257bbb530921", exec_meta, "gpt-5.1-codex-zo921", 1)
+parent = "01a116c6-3c98-7931-bbd3-71e4e2ed0922"
+rollout("zo922", parent, {"originator": "codex-tui", "source": "cli", "thread_source": "user", "model_provider": "syn"}, "gpt-6.1-sol-zo922", 2)
+rollout("zo923", "01a1284c-6fa4-7c13-8d29-e2d8b5660923",
+        {"session_id": parent, "parent_thread_id": parent, "originator": "codex-tui", "source": {"subagent": {"other": "guardian"}}, "thread_source": "guardian_review", "model_provider": "syn"},
+        "codex-auto-review-zo923", 3, typed=False)
+PY
+# (openai_base_url, then each tag's owner, then collector=prompts/sessions).
+CODEX_NATIVE_RUNS=(
+  "https://api.synthetic.new/openai/v1|zo920=synthetic zo921=synthetic zo922=synthetic zo923=synthetic|synthetic=3/3 codex=0/0 local=0/0"
+  "http://127.0.0.1:18493/v1|zo920=local zo921=codex zo922=synthetic zo923=synthetic|synthetic=1/1 codex=1/1 local=1/1"
+  "https://llm-proxy.example.com/v1|zo920= zo921=codex zo922=synthetic zo923=synthetic|synthetic=1/1 codex=1/1 local=0/0"
+  "|zo920=codex zo921=codex zo922=synthetic zo923=synthetic|synthetic=1/1 codex=2/2 local=0/0"
+)
+codex_native_report=""
+for run in "${!CODEX_NATIVE_RUNS[@]}"; do
+  IFS='|' read -r base owners counts <<<"${CODEX_NATIVE_RUNS[$run]}"
+  {
+    if [[ -n $base ]]; then
+      printf 'openai_base_url = "%s"\n\n' "$base"
+    fi
+    printf '[model_providers.syn]\nname = "syn"\nbase_url = "https://api.synthetic.new/openai/v1"\n'
+  } >"$CODEX_NATIVE_HOME/.codex/config.toml"
+  run_all "$CODEX_NATIVE_HOME" "$WORK/codex-native-results-$run"
+  report=$(python3 - "$WORK/codex-native-results-$run" "${base:-no openai_base_url}" "$owners" "$counts" "${collectors[@]}" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+results, label = Path(sys.argv[1]), sys.argv[2]
+owners = dict(pair.split("=") for pair in sys.argv[3].split())
+counts = {cid: tuple(int(n) for n in want.split("/")) for cid, want in (pair.split("=") for pair in sys.argv[4].split())}
+seen = {tag: {} for tag in owners}
+for cid in sys.argv[5:]:
+  try:
+    record = json.loads((results / f"{cid}.json").read_text())
+  except ValueError:
+    print(f"{label}: {cid} printed no JSON record")
+    continue
+  if cid in counts and (record.get("totalPrompts"), record.get("totalSessions")) != counts[cid]:
+    print(f"{label}: {cid} counted prompts and sessions {(record.get('totalPrompts'), record.get('totalSessions'))}, expected {counts[cid]}")
+  for model, bucket in (record.get("modelUsage") or {}).items():
+    total = sum(bucket.get(key) or 0 for key in ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"))
+    for tag in re.findall(r"zo92\d", model):
+      if tag in seen and total:
+        seen[tag][cid] = seen[tag].get(cid, 0) + total
+for tag, owner in owners.items():
+  wrong = [f"{cid} counted it" for cid in sorted(seen[tag]) if cid != owner]
+  if owner and owner not in seen[tag]:
+    wrong.insert(0, f"{owner} missed it")
+  if wrong:
+    print(f"{label}: {tag}, expected {owner or 'nobody'}: {'; '.join(wrong)}")
+PY
+)
+  if [[ -n $report ]]; then
+    codex_native_report+="$report"$'\n'
+  fi
+done
+if [[ -z $codex_native_report ]]; then
+  pass "Codex's built-in provider counts where openai_base_url sends it, and a guardian thread under its parent's session"
+else
+  fail "Codex's built-in provider counts where openai_base_url sends it, and a guardian thread under its parent's session" "$codex_native_report"
+fi

@@ -228,4 +228,17 @@ stats = collectors.Stats()
 for row in rows:
   stats.add_row(row, row.model)
 expect("so Z.ai counts one session, not one per rollout file", stats.snapshot()["totalSessions"], 1)
+
+# A built-in rollout is left unread, and marked so, until openai_base_url
+# sends the built-in provider elsewhere; then the cached stub is read whole,
+# session and all, and the full record stays once nothing needs it.
+native = sessions / "rollout-2026-10-22T12-10-00-01a16451-0000-7000-8000-000000000000.jsonl"
+native.write_text(lines(meta("openai"), turn_context(1, "hf:zai-org/GLM-4.6"), prompt(2, "p"), response(3, "resp_n1", FIRST, FIRST)))
+records, _ = collectors.codex_rollouts(collectors.codex_rollout_cache())
+check("a built-in rollout is skipped while nothing sends it elsewhere", records[str(native)].get("skipped") and not records[str(native)]["days"], records[str(native)])
+records, _ = collectors.codex_rollouts(collectors.codex_rollout_cache(), native=True)
+expect("once something does, the skipped built-in rollout is read whole", days(records[str(native)]), {"hf:zai-org/GLM-4.6": [*tokens(FIRST), 1]})
+expect("under the thread that started it", records[str(native)]["session"], THREAD)
+records, _ = collectors.codex_rollouts(collectors.codex_rollout_cache())
+expect("a built-in rollout read whole stays read", days(records[str(native)]), {"hf:zai-org/GLM-4.6": [*tokens(FIRST), 1]})
 PY

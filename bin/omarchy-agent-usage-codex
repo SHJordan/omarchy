@@ -34,7 +34,10 @@ from collectors import (  # noqa: E402
   base_record,
   cache_root,
   cached_scan,
+  codex_provider_urls,
   codex_rollout_session,
+  codex_route_owner,
+  codex_scan_match,
   emit,
   find_command,
   jwt_claims,
@@ -171,15 +174,24 @@ def record_usage(record, day, model, input_tokens, output_tokens, cache_read, ca
   totals[3] += cache_write
 
 
-def merge_file_record(record):
+def merge_file_record(record, urls):
   """Fold one file's totals, freshly read or replayed from cache, into the run:
   each day and model's tokens at once, and the prompts typed each day. One
   prompt can take many requests, one per tool call it makes, so the requests
-  count no prompts of their own."""
+  count no prompts of their own.
+
+  While openai_base_url sends the built-in provider elsewhere, the models
+  codex_route_owner() gives another collector are left to it, and a rollout
+  none of whose models stay here takes its prompts along."""
   session_key = record["session"]
+  owners = {model: codex_route_owner(NATIVE_PROVIDER, model, urls) for models in record["days"].values() for model in models}
   for day, models in record["days"].items():
     for model, (input_tokens, output_tokens, cache_read, cache_write) in models.items():
-      STATS.add(day, session_key, model, input_tokens, output_tokens, cache_read, cache_write, prompts=0)
+      if owners[model] == AGENT_ID:
+        STATS.add(day, session_key, model, input_tokens, output_tokens, cache_read, cache_write, prompts=0)
+  # A prompt nothing answered was put to Codex's own model.
+  if AGENT_ID not in (set(owners.values()) or {codex_route_owner(NATIVE_PROVIDER, None, urls)}):
+    return
   for day, prompts in record["prompts"].items():
     STATS.add_prompts(day, session_key, prompts)
 
@@ -245,6 +257,9 @@ def scan_opencode_sessions():
 def scan_native_codex_sessions(cached_files, scanned_files):
   """Fold every native rollout into the run, and say whether each was read in
   full."""
+  # Where openai_base_url sends the built-in provider decides which models
+  # are this subscription's.
+  urls = codex_provider_urls()
   home = codex_home()
   roots = [home / "sessions", home / "archived_sessions"]
   files = []
@@ -270,7 +285,7 @@ def scan_native_codex_sessions(cached_files, scanned_files):
       complete = False
     else:
       scanned_files[key] = record
-    merge_file_record(record)
+    merge_file_record(record, urls)
   return complete
 
 
@@ -499,7 +514,8 @@ def run_local_scans(max_age):
 
 
 def cached_local_stats(max_age):
-  return cached_scan(AGENT_ID, scan_sources(), max_age, lambda: run_local_scans(max_age))
+  # The route config can change who bills a rollout without it changing.
+  return cached_scan(AGENT_ID, scan_sources(), max_age, lambda: run_local_scans(max_age), match=codex_scan_match())
 
 
 

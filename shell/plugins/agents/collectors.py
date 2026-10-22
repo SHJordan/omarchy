@@ -2131,7 +2131,9 @@ def claude_code_scan_match(claude_dir: Path | None = None) -> dict[str, str]:
 # here for the collectors that bill them: the local collector for a
 # self-hosted provider, Ollama Cloud for a cloud-tagged model the local
 # daemon forwarded, and a provider's collector for a model_providers entry
-# whose base_url is that provider's host (codex_route_owner).
+# whose base_url is that provider's host (codex_route_owner). While
+# openai_base_url sends the built-in provider elsewhere, its rollouts are read
+# here too.
 
 # The Codex collector counts rollouts on the built-in provider, and ones too
 # old to name a provider at all.
@@ -2145,8 +2147,9 @@ CODEX_WINDOW_DAYS = 30
 # 2 drops totals cached while an untrusted time still counted on the file's day,
 # version 3 those that counted every request as a prompt, version 4 those
 # that missed the responses only Codex 0.163's token_usage_record lines name,
-# and version 5 those with no session.
-CODEX_ROLLOUT_SCHEMA = 5
+# version 5 those with no session, and version 6 those that left a built-in
+# rollout unread without saying so.
+CODEX_ROLLOUT_SCHEMA = 6
 
 _CODEX_MARKERS = ('"token_count"', '"token_usage_record"', '"turn_context"', '"session_meta"', '"user_message"', '"UserMessage"')
 
@@ -2271,11 +2274,12 @@ def _codex_resume(handle: Any, previous: dict[str, Any]) -> dict[str, Any] | Non
     return None
 
 
-def read_codex_rollout(path: Path, stat_result: os.stat_result, previous: dict[str, Any] | None = None) -> dict[str, Any]:
+def read_codex_rollout(path: Path, stat_result: os.stat_result, previous: dict[str, Any] | None = None, native: bool = False) -> dict[str, Any]:
   """One rollout's provider, session (codex_rollout_session) and day ->
   model -> [input, output, cacheRead, cacheWrite, prompts], counted the way
   the Codex collector counts its own. A rollout on the built-in provider, or
-  naming none, is left unread.
+  naming none, is left unread and marked `skipped`, unless `native` asks for
+  it: openai_base_url can send those elsewhere.
 
   A prompt counts on its own day, under the model that answered it: the one
   in effect at the next request, since a legacy rollout can write the prompt
@@ -2354,10 +2358,15 @@ def read_codex_rollout(path: Path, stat_result: os.stat_result, previous: dict[s
             meta = obj(entry.get("payload"))
             record["provider"] = str(meta.get("model_provider") or "").strip().lower()
             # The built-in provider, or none recorded, is the Codex
-            # collector's: nothing here can count it.
+            # collector's unless openai_base_url sends it elsewhere.
             if record["provider"] in ("", CODEX_NATIVE_PROVIDER):
-              done = True
-              break
+              if not native:
+                record["skipped"] = True
+                done = True
+                break
+              # A turn naming no model is Codex's own, as the Codex
+              # collector reads it.
+              current_model = "codex"
             typed = _codex_typed_session(meta)
             record["session"] = codex_rollout_session(meta, typed, path)
             continue
@@ -2466,10 +2475,12 @@ def codex_rollout_cache(agent_id: str | None = None) -> Path | None:
     return None
 
 
-def codex_rollouts(cache_file: Path | None, reuse: bool = True) -> tuple[dict[str, dict[str, Any]], bool]:
-  """Every Codex rollout of the last CODEX_WINDOW_DAYS not on the built-in
-  provider, as read_codex_rollout() reads it, keyed by path, and whether
-  every one was read in full.
+def codex_rollouts(cache_file: Path | None, reuse: bool = True, native: bool = False) -> tuple[dict[str, dict[str, Any]], bool]:
+  """Every Codex rollout of the last CODEX_WINDOW_DAYS, as
+  read_codex_rollout() reads it, keyed by path, and whether every one was
+  read in full. Those on the built-in provider are read only with `native`,
+  while openai_base_url sends it elsewhere (codex_native_endpoint), and a
+  record that skipped one is read again once they are.
 
   Rollouts are append-only, so a file whose mtime and size both match its
   cached record cannot have grown a turn since, and one that grew is read on
@@ -2513,7 +2524,10 @@ def codex_rollouts(cache_file: Path | None, reuse: bool = True) -> tuple[dict[st
     return {}
 
   def current(record: dict[str, Any] | None, stat_result: os.stat_result) -> bool:
-    return record is not None and record["mtime"] == stat_result.st_mtime and record["size"] == stat_result.st_size
+    return (
+      record is not None and record["mtime"] == stat_result.st_mtime and record["size"] == stat_result.st_size
+      and not (native and record.get("skipped"))
+    )
 
   def scan(files: list[tuple[str, Path, os.stat_result]], cached: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], bool]:
     records: dict[str, dict[str, Any]] = {}
@@ -2522,7 +2536,8 @@ def codex_rollouts(cache_file: Path | None, reuse: bool = True) -> tuple[dict[st
     for key, path, stat_result in files:
       record = cached.get(key)
       if not current(record, stat_result):
-        record = read_codex_rollout(path, stat_result, record)
+        # A built-in rollout once skipped is read from the start.
+        record = read_codex_rollout(path, stat_result, None if record and record.get("skipped") else record, native)
       if record["mtime"] is None:
         complete = False
       else:
@@ -2553,15 +2568,19 @@ def _codex_config_urls(path: Path) -> dict[str, str]:
   except (OSError, UnicodeError, tomllib.TOMLDecodeError):
     return {}
   providers = config.get("model_providers")
-  if not isinstance(providers, dict):
-    return {}
-  return {str(name).lower(): str(entry.get("base_url") or "") for name, entry in providers.items() if isinstance(entry, dict)}
+  urls = {str(name).lower(): str(entry.get("base_url") or "") for name, entry in providers.items() if isinstance(entry, dict)} if isinstance(providers, dict) else {}
+  # Where the built-in provider goes in place of OpenAI's API. Codex 0.163
+  # reads it from the config only, never from OPENAI_BASE_URL.
+  if isinstance(config.get("openai_base_url"), str):
+    urls[CODEX_NATIVE_PROVIDER] = config["openai_base_url"]
+  return urls
 
 
 def codex_config_urls() -> dict[str, str]:
   """provider id -> base_url, from the Codex CLI's own config: the system
   layer, the user's config.toml over it, and the profiles
-  (<name>.config.toml) Codex layers over that when one is selected."""
+  (<name>.config.toml) Codex layers over that when one is selected. The
+  built-in `openai` provider's is its openai_base_url."""
   home = codex_home()
   urls: dict[str, str] = {}
   for path in (Path("/etc/codex/config.toml"), home / "config.toml", *sorted(home.glob("*.config.toml"))):
@@ -2582,16 +2601,19 @@ def codex_provider_urls() -> dict[str, str]:
   provider the config no longer has keeps the last one it had. The current
   config always wins. A provider only ever given on the command line (`-c
   model_providers...`) or in a project's .codex/config.toml is never seen
-  here: local.json names those for the local collector.
+  here: local.json names those for the local collector. The built-in
+  provider's openai_base_url is never remembered: once the config drops it,
+  Codex is back on OpenAI's API, as Claude Code is once ANTHROPIC_BASE_URL
+  goes.
   """
   path = codex_providers_path()
   homes = read_json(path).get("homes")
   homes = homes if isinstance(homes, dict) else {}
   key = str(codex_home())
   known = homes.get(key)
-  known = {str(pid): url for pid, url in known.items() if isinstance(url, str) and url} if isinstance(known, dict) else {}
+  known = {str(pid): url for pid, url in known.items() if isinstance(url, str) and url and pid != CODEX_NATIVE_PROVIDER} if isinstance(known, dict) else {}
   urls = {**known, **codex_config_urls()}
-  remembered = {pid: url for pid, url in urls.items() if url}
+  remembered = {pid: url for pid, url in urls.items() if url and pid != CODEX_NATIVE_PROVIDER}
   if remembered != known:
     try:
       path.parent.mkdir(parents=True, exist_ok=True)
@@ -2603,18 +2625,54 @@ def codex_provider_urls() -> dict[str, str]:
   return urls
 
 
+def codex_openai_model(model: Any) -> bool:
+  """Whether a model is one OpenAI serves Codex (gpt-5.1-codex,
+  codex-auto-review, o3), or none is named; gpt-oss is open weights anyone
+  runs."""
+  name = str(model or "").strip().lower().rpartition("/")[2]
+  if name.startswith("gpt-oss"):
+    return False
+  return not name or name.startswith(("gpt-", "chatgpt-")) or "codex" in name or re.fullmatch(r"o[1-9](-.*)?", name) is not None
+
+
+def codex_native_endpoint(urls: dict[str, str]) -> str:
+  """Where openai_base_url sends the built-in provider: "" for OpenAI's own
+  API (no override), a provider collector's id, `local`, or `other` for a
+  host nothing here can place."""
+  base = urls.get(CODEX_NATIVE_PROVIDER, "")
+  host = url_host(base)
+  if not host or host in ("openai.com", "chatgpt.com") or host.endswith((".openai.com", ".chatgpt.com")):
+    return ""
+  return endpoint_owner(base) or "other"
+
+
 def codex_route_owner(provider: Any, model: Any, urls: dict[str, str]) -> str | None:
-  """The provider collector that bills a Codex rollout on `provider`, with
-  the model that answered, or None for one no provider's collector counts
-  (the local collector decides which of those it ran itself). The built-in
-  provider is `codex`'s. A model_providers entry whose base_url is a
-  provider's host is that provider's, whatever its id; one on the user's own
-  hardware or a host nothing here can place is no provider's. Past that,
-  `ollama-cloud`, and a cloud-tagged model through the local daemon's
-  `ollama`, are Ollama Cloud's."""
+  """The collector that bills a Codex rollout on `provider`, with the model
+  that answered, or None for one no provider's collector counts (the local
+  collector decides which of those it ran itself).
+
+  The built-in provider is `codex`'s until openai_base_url sends it
+  elsewhere. A provider's host there bills all of it. Otherwise an Ollama
+  cloud tag is Ollama's, and OpenAI's own models stay `codex`'s through a
+  proxy that may forward to it; a self-hosted URL makes any other model
+  `local`'s, and a host nothing here can place counts it nowhere, as
+  claude_code_owner() reads ANTHROPIC_BASE_URL.
+
+  A model_providers entry whose base_url is a provider's host is that
+  provider's, whatever its id; one on the user's own hardware or a host
+  nothing here can place is no provider's. Past that, `ollama-cloud`, and a
+  cloud-tagged model through the local daemon's `ollama`, are Ollama
+  Cloud's."""
   name = str(provider or "").strip().lower()
   if name in ("", CODEX_NATIVE_PROVIDER):
-    return "codex"
+    endpoint = codex_native_endpoint(urls)
+    if endpoint not in ("", "local", "other"):
+      return endpoint
+    if endpoint and cloud_model(model):
+      return "ollama"
+    if not endpoint or codex_openai_model(model):
+      return "codex"
+    return "local" if endpoint == "local" else None
   owner = endpoint_owner(urls.get(name))
   if owner and owner != "local":
     return owner
@@ -2638,7 +2696,7 @@ def scan_codex_routed(owner: str, reuse: bool = True) -> tuple[list[UsageRow], b
   urls = codex_provider_urls()
   if owner != "ollama" and not any(endpoint_owner(url) == owner for url in urls.values()):
     return [], True
-  records, complete = codex_rollouts(codex_rollout_cache(), reuse=reuse)
+  records, complete = codex_rollouts(codex_rollout_cache(), reuse=reuse, native=codex_native_endpoint(urls) != "")
   rows = [
     UsageRow(day, record["session"], owner, model, *totals[:4], prompts=totals[4])
     for record in records.values()

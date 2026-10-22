@@ -44,6 +44,7 @@ from collectors import (  # noqa: E402
   cached_scan,
   cloud_model,
   codex_home,
+  codex_native_endpoint,
   codex_rollout_cache,
   codex_provider_urls,
   codex_route_owner,
@@ -246,15 +247,17 @@ def harness_match():
 
 
 def scan_codex(stats, use_file_cache):
-  records, complete = codex_rollouts(codex_rollout_cache(), reuse=use_file_cache)
+  endpoints = classifier().endpoints
+  records, complete = codex_rollouts(codex_rollout_cache(), reuse=use_file_cache, native=codex_native_endpoint(endpoints) != "")
   for record in records.values():
-    if not classifier().provider_is_local(record["provider"]):
-      continue
     for day, models in record["days"].items():
       for model, (input_tokens, output_tokens, cache_read, cache_write, prompts) in models.items():
         # A provider's host, or Ollama Cloud, bills the rollouts
-        # codex_route_owner() places, whatever the provider's id.
-        if not cloud_model(model) and codex_route_owner(record["provider"], model, classifier().endpoints) is None:
+        # codex_route_owner() places, whatever the provider's id, and it
+        # gives the built-in provider's to this one while openai_base_url
+        # is self-hosted.
+        owner = codex_route_owner(record["provider"], model, endpoints)
+        if owner == "local" or (owner is None and classifier().provider_is_local(record["provider"]) and not cloud_model(model)):
           # A Codex rollout's totals arrive per day and model, prompts
           # counted, under the session that started it.
           stats.add(day, record["session"], model, input_tokens, output_tokens, cache_read, cache_write, prompts=prompts)
