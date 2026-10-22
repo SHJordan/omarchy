@@ -88,8 +88,9 @@ PROMPT_SUBTYPES = (None, "mid_turn_user_message")
 # Version 3 counted a reply's thinking twice where its output held it.
 # Version 4 kept no reply's auth type and model id, which say where it was
 # sent. Version 5 kept no failed request, which says where a prompt went that
-# no reply answered.
-INDEX_VERSION = 6
+# no reply answered. Version 6 keyed a reply by its response id, which a
+# server that recycles ids gives different replies.
+INDEX_VERSION = 7
 INDEX_HEAD_BYTES = 4096
 
 MAX_MODEL_NAME_LEN = 120
@@ -190,7 +191,8 @@ def parse_line(raw, session):
   A prompt is ["p", key, time, session]; a billed response is
   ["r", key, time, session, model, input, output, cacheRead, authType,
   modelId]; a failed request is ["e", key, time, session, authType, modelId].
-  The key dedups a record a resumed or branched session carries again.
+  The key, the record's uuid, dedups a record a branched session carries
+  again.
   """
   if b'"user"' not in raw and API_RESPONSE_EVENT.encode() not in raw and API_ERROR_EVENT.encode() not in raw:
     return None
@@ -238,7 +240,11 @@ def parse_line(raw, session):
     output += thoughts
   if prompt + output <= 0:
     return None
-  key = str(event.get("response_id") or "") or uuid
+  # /branch copies each record verbatim, its uuid included, and a resumed
+  # session appends to its own transcript, so the uuid is what a copy shares.
+  # A server's response id is not: one that recycles short ids gives
+  # different replies the same one.
+  key = uuid or str(event.get("response_id") or "")
   if not key:
     return None
   return ["r", key, stamp, session, model, prompt - cached, output, cached, str(event.get("auth_type") or ""), str(event.get("model"))]
