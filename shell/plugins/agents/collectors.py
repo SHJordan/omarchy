@@ -2561,7 +2561,9 @@ def codex_rollouts(cache_file: Path | None, reuse: bool = True, native: bool = F
 
   Rollouts are append-only, so a file whose mtime and size both match its
   cached record cannot have grown a turn since, and one that grew is read on
-  from where its record stopped; `reuse=False` reads them all again. A
+  from where its record stopped; `reuse=False` reads them all again, but
+  takes what another forced read wrote while it ran, so the collectors one
+  refresh forces read every rollout once between them. A
   record keeps every turn whatever its provider, so the caller decides which
   providers and models are its own, and every caller shares the cache
   codex_rollout_cache() names: any `cache_file` stands for it, and None
@@ -2589,16 +2591,30 @@ def codex_rollouts(cache_file: Path | None, reuse: bool = True, native: bool = F
           found.append((str(path), path, stat_result))
     return found
 
+  started = time.time()
+  # When a forced read last wrote the cache: every record in it was read
+  # afresh since, replayed from that read or read since.
+  forced_at: list[float | None] = [None]
+
   def load() -> dict[str, Any]:
-    if shared is None or not reuse:
+    forced_at[0] = None
+    if shared is None:
       return {}
     try:
       payload = read_json(shared)
     except OSError:
       payload = {}
-    if payload.get("schemaVersion") == CODEX_ROLLOUT_SCHEMA and payload.get("zone") == _codex_cache_zone():
-      return {path: record for path, record in obj(payload.get("files")).items() if _codex_record_valid(record)}
-    return {}
+    if payload.get("schemaVersion") != CODEX_ROLLOUT_SCHEMA or payload.get("zone") != _codex_cache_zone():
+      return {}
+    stamp = payload.get("forcedAt")
+    stamp = stamp if type(stamp) in (int, float) else None
+    # A forced read reuses only what another forced read wrote while this one
+    # ran, so a refresh rereads every rollout once, whichever collector gets
+    # to the lock first, and never replays an older cache.
+    if not reuse and (stamp is None or stamp < started):
+      return {}
+    forced_at[0] = stamp
+    return {path: record for path, record in obj(payload.get("files")).items() if _codex_record_valid(record)}
 
   def current(record: dict[str, Any] | None, stat_result: os.stat_result) -> bool:
     return (
@@ -2622,7 +2638,8 @@ def codex_rollouts(cache_file: Path | None, reuse: bool = True, native: bool = F
       records[key] = record
     if shared is not None and kept != cached:
       try:
-        write_json(shared, {"schemaVersion": CODEX_ROLLOUT_SCHEMA, "zone": _codex_cache_zone(), "files": kept})
+        stamp = forced_at[0] if reuse else time.time()
+        write_json(shared, {"schemaVersion": CODEX_ROLLOUT_SCHEMA, "zone": _codex_cache_zone(), "forcedAt": stamp, "files": kept})
       except OSError as exc:
         warn(f"could not write file cache ({exc})")
     return records, complete

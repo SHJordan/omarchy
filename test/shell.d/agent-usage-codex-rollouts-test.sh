@@ -16,6 +16,8 @@ agent_sandbox
 python3 - <<'PY'
 import json
 import os
+import threading
+import time
 from pathlib import Path
 
 from agent_usage_fixtures import *
@@ -241,4 +243,34 @@ expect("once something does, the skipped built-in rollout is read whole", days(r
 expect("under the thread that started it", records[str(native)]["session"], THREAD)
 records, _ = collectors.codex_rollouts(collectors.codex_rollout_cache())
 expect("a built-in rollout read whole stays read", days(records[str(native)]), {"hf:zai-org/GLM-4.6": [*tokens(FIRST), 1]})
+
+# ------------------------------------------------- one forced refresh
+
+# A refresh forces every collector at once. The ones that wait for the lock
+# take what the first forced read wrote meanwhile, built-in rollouts read
+# whole included, so each rollout is parsed once per refresh, not once per
+# collector, while a forced read after that one parses them all again.
+files = sorted(str(path) for path in sessions.glob("*.jsonl"))
+lock = collectors.codex_rollout_cache().with_name(collectors.codex_rollout_cache().name + ".lock")
+reads = []
+forced = []
+collectors.read_codex_rollout = reader
+try:
+  # Every one of them is waiting for the lock before any gets it.
+  with collectors.exclusive_lock(lock):
+    threads = [threading.Thread(target=lambda: forced.append(collectors.codex_rollouts(collectors.codex_rollout_cache(), reuse=False, native=True))) for _ in range(3)]
+    for thread in threads:
+      thread.start()
+    time.sleep(0.5)
+  for thread in threads:
+    thread.join()
+  once = sorted(str(path) for path in reads)
+  reads.clear()
+  collectors.codex_rollouts(collectors.codex_rollout_cache(), reuse=False, native=True)
+  again = sorted(str(path) for path in reads)
+finally:
+  collectors.read_codex_rollout = real_reader
+expect("collectors forced together parse each rollout once between them", once, files)
+check("and each gets every rollout, read whole", len(forced) == 3 and all(sorted(records) == files and not any(r.get("skipped") for r in records.values()) for records, _ in forced), forced)
+expect("a forced read after theirs parses every rollout again", again, files)
 PY
