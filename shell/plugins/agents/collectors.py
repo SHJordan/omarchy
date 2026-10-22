@@ -803,9 +803,10 @@ def _pi_row(entry: dict, timestamp: Any, path: str, provider: str, model: str, u
   return _pi_key(entry, timestamp, path), UsageRow(day, path, provider, model, input_tokens, output_tokens, cache_read, cache_write, prompts)
 
 
-def _pi_rows(path: str, lines: list[tuple[int, Any]], accept: Accept) -> Iterator[tuple[int, tuple, UsageRow]]:
-  """(line number, dedup key, row) for each (line number, entry) of one
-  session file, in order, that `accept` takes.
+def _pi_rows(path: str, lines: list[tuple[int, Any]], accept: Accept) -> Iterator[tuple[int, tuple, UsageRow, tuple]]:
+  """(line number, dedup key, row, prompt keys) for each (line number,
+  entry) of one session file, in order, that `accept` takes, the prompt keys
+  naming the typed prompts the row's `prompts` count.
 
   `lines` hold every model switch, user and assistant message in the file.
   Usage with no provider of its own bills the model the session was on: the
@@ -834,7 +835,7 @@ def _pi_rows(path: str, lines: list[tuple[int, Any]], accept: Accept) -> Iterato
   # or () for one omp refused before sending it.
   failed: tuple | None = None
 
-  def unanswered() -> Iterator[tuple[int, tuple, UsageRow]]:
+  def unanswered() -> Iterator[tuple[int, tuple, UsageRow, tuple]]:
     for line_number, key, day, before in asked:
       target = before if failed is None else failed
       if day is None or not target:
@@ -845,7 +846,7 @@ def _pi_rows(path: str, lines: list[tuple[int, Any]], accept: Accept) -> Iterato
           continue
       except Exception:
         continue
-      yield line_number, ("asked", *key), UsageRow(day, path, provider, model, 0, 0, 0, 0, 1)
+      yield line_number, ("asked", *key), UsageRow(day, path, provider, model, 0, 0, 0, 0, 1), (key,)
 
   for line_number, entry, line in parsed:
     try:
@@ -895,11 +896,14 @@ def _pi_rows(path: str, lines: list[tuple[int, Any]], accept: Accept) -> Iterato
     key, row = counted
     # Prompts typed on the reply's day ride on its row; one typed on another
     # day is a row of its own there, keyed by the reply that answered it.
-    days = Counter(day for _, _, day, _ in answered if day is not None)
-    row = row._replace(prompts=row.prompts + days.pop(row.day, 0))
-    yield line_number, key, row
-    for day, prompts in sorted(days.items()):
-      yield line_number, ("prompt", day, *key), UsageRow(day, path, provider, model, 0, 0, 0, 0, prompts)
+    days: dict[str, list[tuple]] = {}
+    for _, prompt, day, _ in answered:
+      if day is not None:
+        days.setdefault(day, []).append(prompt)
+    asks = days.pop(row.day, [])
+    yield line_number, key, row._replace(prompts=row.prompts + len(asks)), tuple(asks)
+    for day, asks in sorted(days.items()):
+      yield line_number, ("prompt", day, *key), UsageRow(day, path, provider, model, 0, 0, 0, 0, len(asks)), tuple(asks)
   yield from unanswered()
 
 
@@ -936,15 +940,15 @@ def scan_pi_sessions(pattern: str, accept: Accept, roots: Iterable[Path] | None 
 
   # (root, path, line) of every counted line, so the rows come back in one
   # order however rg's threads interleave the files.
-  found: list[tuple[int, str, int, tuple, UsageRow]] = []
+  found: list[tuple[int, str, int, tuple, UsageRow, tuple]] = []
   complete = True
   # Each file's lines, folded in order when rg finishes the file.
   pending: dict[str, list[tuple[int, Any]]] = {}
 
   def fold(index: int, path: str) -> None:
     lines = sorted(pending.pop(path, []), key=lambda line: line[0])
-    for line_number, key, row in _pi_rows(path, lines, accept):
-      found.append((index, path, line_number, key, row))
+    for line_number, key, row, asks in _pi_rows(path, lines, accept):
+      found.append((index, path, line_number, key, row, asks))
 
   def run_rg(args: list[str], targets: list[bytes]) -> Iterator[bytes]:
     """rg's output lines for `args` over `targets`, a batch of them at a time
@@ -1027,8 +1031,16 @@ def scan_pi_sessions(pattern: str, accept: Accept, roots: Iterable[Path] | None 
 
   first: dict[tuple, UsageRow] = {}
   holders: dict[tuple, list[str]] = {}
-  for _, path, _, key, row in sorted(found, key=lambda item: item[:3]):
-    first.setdefault(key, row)
+  # A typed prompt is its own message, so it counts once by its own key
+  # however it was booked: a fork can copy one its parent left unanswered
+  # and answer it, booking it on a reply the parent never had.
+  claimed: set[tuple] = set()
+  for _, path, _, key, row, asks in sorted(found, key=lambda item: item[:3]):
+    if key not in first:
+      repeated = sum(1 for ask in asks if ask in claimed)
+      claimed.update(asks)
+      row = row._replace(prompts=row.prompts - repeated)
+      first[key] = row
     if path not in holders.setdefault(key, []):
       holders[key].append(path)
 
@@ -1046,6 +1058,8 @@ def scan_pi_sessions(pattern: str, accept: Accept, roots: Iterable[Path] | None 
 
   rows = []
   for key, row in first.items():
+    if not (row.prompts or row.input_tokens or row.output_tokens or row.cache_read or row.cache_write):
+      continue
     paths = holders[key]
     if len(paths) > 1:
       roots_of_copy = [path for path in paths if not ancestors(path) & set(paths)]

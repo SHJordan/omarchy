@@ -1076,6 +1076,22 @@ check(
   json.dumps([row._asdict() for row in rows]),
 )
 
+# A prompt left unanswered in a pi session (its request failed) and answered
+# in a fork that copied it, as pi 1.4.0 and omp 18.12.6 copy a message with
+# its id and timestamp, is one prompt, counted once.
+retried_root = work / "retried-pi"
+retried_root.mkdir()
+retried = [{"type": "model_change", "id": "m1", "timestamp": failed_stamp, "provider": "demo", "modelId": "e2e-failpi"}, pi_user(1), pi_reply(1, "demo", zero_usage)]
+write_session(retried_root / "parent.jsonl", retried, header={"type": "session", "version": 3, "id": "s-parent", "timestamp": failed_stamp})
+write_session(retried_root / "fork.jsonl", retried + [pi_reply(2, "demo", {"input": 40, "output": 1})],
+              header={"type": "session", "version": 3, "id": "s-fork", "timestamp": failed_stamp, "parentSession": str(retried_root / "parent.jsonl")})
+rows, complete = collectors.scan_pi_sessions(r'"provider"\s*:\s*"demo"', lambda *_: True, [retried_root])
+check(
+  "a pi prompt unanswered in its session and answered in a fork counts once",
+  complete and sum(row.prompts for row in rows) == 1 and sum(row.input_tokens for row in rows) == 40,
+  json.dumps([row._asdict() for row in rows]),
+)
+
 # ------------------------------------------------------------- endpoints
 
 # A base URL's host says who bills what it serves: a provider's own host or
