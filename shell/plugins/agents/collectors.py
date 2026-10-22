@@ -686,7 +686,8 @@ def pi_parent_session(path: str) -> str | None:
       return None
     with open(path, encoding="utf-8", errors="replace") as handle:
       header = json.loads(handle.readline())
-  except (OSError, ValueError):
+  except (OSError, ValueError, RecursionError):
+    # RecursionError: a damaged header nested deeper than the parser goes.
     return None
   parent = header.get("parentSession") if isinstance(header, dict) else None
   if not isinstance(parent, str) or not parent:

@@ -1303,6 +1303,11 @@ check(
 for name in ("CURSOR_API_KEY", "CURSOR_AUTH_PATH"):
   os.environ.pop(name)
 
+deep_header = work / "deep-header.jsonl"
+deep_header.write_text("[" * 200_000 + "\n")
+check("a session header nested deeper than the parser goes names no parent instead of stopping the scan",
+      collectors.pi_parent_session(str(deep_header)) is None)
+
 # --------------------------------------------------------------- accounts
 
 os.environ["XDG_STATE_HOME"] = str(work / "state")
