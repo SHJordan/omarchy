@@ -182,9 +182,11 @@ def accept_opencode(provider, model, entry):
 # --------------------------------------------------- harnesses of their own
 
 # Kimi Code, Qwen Code, Hermes and Mistral Vibe keep their sessions in stores
-# of their own, and record where each request went. Each one's collector
-# reads its store and says who bills each row (harness_rows), so this one
-# takes the rows a server you run answered from the same reader.
+# of their own. Each one's collector reads its store and says who bills each
+# row (harness_rows), from the route Hermes and older Vibe sessions record
+# or, for Kimi Code, Qwen Code and Vibe's Unified Harness, from the current
+# config, so this one takes the rows a server you run answered from the same
+# reader.
 HARNESSES = ("hermes", "kimi", "qwen", "vibe")
 
 
