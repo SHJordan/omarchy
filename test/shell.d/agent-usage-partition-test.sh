@@ -2354,3 +2354,52 @@ if [[ -z $codex_profile_report ]]; then
 else
   fail "a Codex profile's openai_base_url moves only the rollouts on its model, and a claimed id on this machine is local's" "$codex_profile_report"
 fi
+
+# Kimchi 1.18 names each gateway route kimchi-dev/<upstream>, and the kimchi
+# collector claims every such id by its prefix. A local.json naming one must
+# not make local count those rows as well, while a self-hosted id beside it
+# still counts. The replies are pi's own shape on Kimchi's gateway.
+PREFIX_HOME="$WORK/kimchi-prefix"
+mkdir -p "$PREFIX_HOME/.config/omarchy/agents" "$PREFIX_HOME/.pi/agent/sessions/-" "$PREFIX_HOME/.cache" "$PREFIX_HOME/.run"
+echo '{"providers": ["Kimchi-Dev/MoonshotAI", "my-llama"]}' >"$PREFIX_HOME/.config/omarchy/agents/local.json"
+python3 - "$PREFIX_HOME/.pi/agent/sessions/-/session.jsonl" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+
+now = datetime.now(timezone.utc)
+stamp = now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+ms = int(now.timestamp() * 1000)
+lines = [
+  {"type": "session", "version": 3, "id": "01a16377-aaaa-72fe-95e0-9faf99826e64", "timestamp": stamp, "cwd": "/home/me"},
+  {"type": "model_change", "id": "29d6576e", "parentId": None, "timestamp": stamp, "model": "kimchi/kimi-k2.5"},
+]
+for index, (provider, model, tokens) in enumerate((("kimchi-dev/moonshotai", "kimi-k2.5", 4201), ("my-llama", "llama-3.3", 3101))):
+  lines.append({"type": "message", "id": f"u{index}", "timestamp": stamp, "message": {"role": "user", "content": [{"type": "text", "text": "Say hi"}], "attribution": "user", "timestamp": ms}})
+  usage = {"input": tokens, "output": 82, "cacheRead": 102, "cacheWrite": 0, "totalTokens": tokens + 184, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}}
+  lines.append({"type": "message", "id": f"a{index}", "parentId": f"u{index}", "timestamp": stamp, "message": {"role": "assistant", "content": [{"type": "text", "text": "Hi."}], "api": "openai-completions", "provider": provider, "model": model, "usage": usage, "stopReason": "stop", "timestamp": ms, "responseId": f"chatcmpl-{index}"}})
+with open(sys.argv[1], "w") as handle:
+  handle.writelines(json.dumps(line) + "\n" for line in lines)
+PY
+run_collector "$PREFIX_HOME" local "$WORK/prefix-local"
+run_collector "$PREFIX_HOME" kimchi "$WORK/prefix-kimchi"
+prefix_report=$(python3 - "$WORK/prefix-local.json" "$WORK/prefix-kimchi.json" <<'PY'
+import json
+import sys
+
+problems = []
+for path, expected in zip(sys.argv[1:], ({"llama-3.3"}, {"kimi-k2.5"})):
+  try:
+    models = set(json.load(open(path)).get("todayTokensByModel") or {})
+  except (OSError, ValueError) as error:
+    models = {f"unreadable: {error}"}
+  if models != expected:
+    problems.append(f"{path.rsplit('/', 1)[-1]} counts {sorted(models)}, expected {sorted(expected)}")
+print("\n".join(problems))
+PY
+)
+if [[ -z $prefix_report ]]; then
+  pass "local leaves a configured kimchi-dev/<upstream> id to the kimchi collector"
+else
+  fail "local leaves a configured kimchi-dev/<upstream> id to the kimchi collector" "$prefix_report"
+fi

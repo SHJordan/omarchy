@@ -109,6 +109,10 @@ CLAIMED_PROVIDERS = {
   "zhipu-coding-plan", "zhipuai", "zhipuai-coding-plan",  # zai
 }
 
+# Ids a collector claims by prefix rather than whole: Kimchi 1.18 names each
+# gateway route kimchi-dev/<upstream>, and kimchi counts every one.
+CLAIMED_PREFIXES = ("kimchi-dev/",)  # kimchi
+
 def model_name(raw):
   return str(raw or "").strip() or AGENT_ID
 
@@ -143,7 +147,7 @@ class Classifier:
     self.endpoints = codex_provider_urls()
     ids = set(KNOWN_LOCAL_PROVIDERS) | self.configured
     ids |= {pid for pid, url in self.endpoints.items() if url and self_hosted(url) and not codex_native_key(pid)}
-    self.local_ids = ids - CLAIMED_PROVIDERS
+    self.local_ids = {pid for pid in ids - CLAIMED_PROVIDERS if not pid.startswith(CLAIMED_PREFIXES)}
 
   def provider_is_local(self, provider):
     return str(provider or "").strip().lower() in self.local_ids
