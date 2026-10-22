@@ -2743,7 +2743,7 @@ def codex_native_endpoint(urls: dict[str, str]) -> str:
 def codex_route_owner(provider: Any, model: Any, urls: dict[str, str]) -> str | None:
   """The collector that bills a Codex rollout on `provider`, with the model
   that answered, or None for one no provider's collector counts (the local
-  collector decides which of those it ran itself).
+  collector decides which of those `--oss` and local.json ran itself).
 
   The built-in provider is `codex`'s until openai_base_url sends it
   elsewhere. A provider's host there bills all of it. Otherwise an Ollama
@@ -2753,10 +2753,11 @@ def codex_route_owner(provider: Any, model: Any, urls: dict[str, str]) -> str | 
   claude_code_owner() reads ANTHROPIC_BASE_URL.
 
   A model_providers entry whose base_url is a provider's host is that
-  provider's, whatever its id; one on the user's own hardware or a host
-  nothing here can place is no provider's. Past that, `ollama-cloud`, and a
-  cloud-tagged model through the local daemon's `ollama`, are Ollama
-  Cloud's."""
+  provider's, whatever its id; one at a host nothing here can place is no
+  provider's. Past that, `ollama-cloud`, and a cloud-tagged model through
+  the local daemon's `ollama`, are Ollama Cloud's, and any other model on
+  the user's own hardware is `local`'s, whatever the entry's id: the base
+  URL decides, not an id another collector claims elsewhere."""
   name = str(provider or "").strip().lower()
   if name in ("", CODEX_NATIVE_PROVIDER):
     endpoint = codex_native_endpoint(urls)
@@ -2772,7 +2773,7 @@ def codex_route_owner(provider: Any, model: Any, urls: dict[str, str]) -> str | 
     return owner
   if name == "ollama-cloud" or (name == "ollama" and cloud_model(model)):
     return "ollama"
-  return None
+  return "local" if owner == "local" and not cloud_model(model) else None
 
 
 def codex_scan_match() -> dict[str, Any]:
