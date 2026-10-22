@@ -127,9 +127,11 @@ expect("Qwen counts a Responses API reply's reasoning once, and other thinking o
 
 # Qwen Code 0.26.0's records from two sessions against a server that recycles
 # response ids: each got chatcmpl-mock1208 and chatcmpl-mock1209 for replies
-# of the same size, a minute apart. Both count. /branch copies a record
-# verbatim, its uuid included, under the new session with a forkedFrom, and
-# that copy counts once.
+# of the same size, a minute apart. Both count. --fork-session copies a
+# record verbatim, its uuid included, under the new session with a
+# forkedFrom, and that copy counts once, in the session that wrote it, though
+# the fork's file name sorts first; the fork counts for the prompt typed into
+# it.
 studio()
 first = [
   prompt("8b0e5c1a-6f4d-4a0e-9a51-3c0f1b6c2d10", "f73baca5-d3d4-4eb9-8008-20dc4951f613", NOW),
@@ -143,11 +145,15 @@ transcript(chats("-home-me-proj-qwen11") / "61cea1b3-8fa7-433b-b69c-cce255da2433
   response("d7f750d2-72ec-47ef-82a1-9e1400e2c289", "61cea1b3-8fa7-433b-b69c-cce255da2433", NOW, "qwen-sp-model", "openai", 10313, 59, 79, 0, "chatcmpl-mock1209", total=10372),
 ])
 branched = [{**line, "sessionId": "9d1e4b27-3f6a-4c08-b5e2-0a7c8d9e1f23", "forkedFrom": {"sessionId": line["sessionId"], "messageUuid": line["uuid"]}} for line in first]
-transcript(chats("-home-me-proj-qwen10") / "9d1e4b27-3f6a-4c08-b5e2-0a7c8d9e1f23.jsonl", branched)
+transcript(chats("-home-me-proj-qwen10") / "9d1e4b27-3f6a-4c08-b5e2-0a7c8d9e1f23.jsonl", [
+  *branched,
+  prompt("6bcf502c-f7ae-46ec-882c-721ccc6ca9a3", "9d1e4b27-3f6a-4c08-b5e2-0a7c8d9e1f23", NOW),
+  response("4b804879-1b4d-45b5-a2d6-81ef1ee79f4b", "9d1e4b27-3f6a-4c08-b5e2-0a7c8d9e1f23", NOW, "qwen-sp-model", "openai", 4314, 46, 0, 0, "chatcmpl-mock1210", total=4360),
+])
 record = qwen()
-expect("Qwen counts different replies a server gave the same response id, and a branched copy once", {
-  key: record[key] for key in ("todayTotalTokens", "todayPrompts")
-}, {"todayTotalTokens": 2 * (9370 + 10372), "todayPrompts": 2}, record)
+expect("Qwen counts different replies a server gave the same response id, and a forked copy once, in its source session", {
+  key: record[key] for key in ("todayTotalTokens", "todayPrompts", "todaySessions")
+}, {"todayTotalTokens": 2 * (9370 + 10372) + 4360, "todayPrompts": 3, "todaySessions": 3}, record)
 
 # ------------------------------------------------------------------ routes
 
