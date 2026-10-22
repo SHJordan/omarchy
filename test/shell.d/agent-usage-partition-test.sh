@@ -2558,3 +2558,94 @@ if [[ -z $codex_switched_report ]]; then
 else
   fail "a Codex model switch books the requests and prompts after thread_settings_applied to the model switched to" "$codex_switched_report"
 fi
+
+# --------------------- A pi or omp prompt a fork answered on another provider
+
+# A fork copies its parent's messages with their ids and timestamps, so a
+# prompt the parent's provider failed on and a fork answered after switching
+# provider (`/model`) is one typed message. It counts once, under the
+# collector of the reply that answered it, never also under the parent's
+# provider, even when the fork holds no line of the parent's provider at all.
+FORKED_HOME="$WORK/pi-forked-provider"
+python3 - "$FORKED_HOME" <<'PY'
+import json
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+home = Path(sys.argv[1])
+now = datetime.now(timezone.utc)
+
+
+def stamp(offset):
+  return (now + timedelta(seconds=offset)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def millis(offset):
+  return int((now + timedelta(seconds=offset)).timestamp() * 1000)
+
+
+def user(entry_id, offset):
+  return {"type": "message", "id": entry_id, "parentId": None, "timestamp": stamp(offset),
+          "message": {"role": "user", "content": [{"type": "text", "text": "go"}], "timestamp": millis(offset)}}
+
+
+def reply(entry_id, provider, model, offset, tokens, **extra):
+  usage = {"input": tokens, "output": 1 if tokens else 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": tokens + 1 if tokens else 0,
+           "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}}
+  message = {"role": "assistant", "content": [], "api": "openai-completions", "provider": provider, "model": model, "usage": usage,
+             "stopReason": "stop" if tokens else "error", "timestamp": millis(offset), **extra}
+  if not tokens:
+    message["errorMessage"] = "400 status code (no body)"
+  return {"type": "message", "id": entry_id, "parentId": None, "timestamp": stamp(offset), "message": message}
+
+
+def write(path, header, lines):
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text("".join(json.dumps(line) + "\n" for line in [header, *lines]))
+
+
+# pi 1.4.0: kimchi failed on the prompt, and the fork answered it on openrouter.
+pi = home / ".pi/agent/sessions/--home-me--"
+parent = [{"type": "model_change", "id": "zf1", "parentId": None, "timestamp": stamp(0), "provider": "kimchi", "modelId": "kimi-k2.5-zf950"},
+          user("zf2", 1), reply("zf3", "kimchi", "kimi-k2.5-zf950", 2, 0)]
+write(pi / "parent.jsonl", {"type": "session", "version": 3, "id": "zf-parent", "timestamp": stamp(0), "cwd": "/home/me"}, parent)
+write(pi / "fork.jsonl", {"type": "session", "version": 3, "id": "zf-fork", "timestamp": stamp(3), "cwd": "/home/me", "parentSession": str(pi / "parent.jsonl")},
+      parent + [{"type": "model_change", "id": "zf4", "parentId": None, "timestamp": stamp(3), "provider": "openrouter", "modelId": "z-ai/glm-zf951"},
+                reply("zf5", "openrouter", "z-ai/glm-zf951", 4, 40)])
+# omp 18.12: zai failed on the prompt, and a fork cut before that reply
+# answered it on synthetic, so the fork holds no zai line.
+omp = home / ".omp/agent/sessions/--home-me--"
+prompt = user("zf6", 1)
+write(omp / "parent.jsonl", {"type": "session", "version": 3, "id": "zf-oparent", "timestamp": stamp(0), "cwd": "/home/me"},
+      [prompt, reply("zf7", "zai", "glm-zf952", 2, 0, errorStatus=400, duration=310)])
+write(omp / "fork.jsonl", {"type": "session", "version": 3, "id": "zf-ofork", "timestamp": stamp(3), "cwd": "/home/me", "parentSession": str(omp / "parent.jsonl")},
+      [prompt, {"type": "model_change", "id": "zf8", "parentId": None, "timestamp": stamp(3), "model": "synthetic/hf:zai-org/GLM-zf953"},
+       reply("zf9", "synthetic", "hf:zai-org/GLM-zf953", 4, 50, duration=820)])
+PY
+for id in kimchi openrouter zai synthetic; do
+  run_collector "$FORKED_HOME" "$id" "$WORK/pi-forked-$id"
+done
+forked_report=$(python3 - "$WORK" <<'PY'
+import json
+import sys
+
+expected = {"kimchi": (0, 0), "openrouter": (1, 41), "zai": (0, 0), "synthetic": (1, 51)}
+problems = []
+for id, want in expected.items():
+  try:
+    record = json.load(open(f"{sys.argv[1]}/pi-forked-{id}.json"))
+  except (OSError, ValueError) as error:
+    problems.append(f"{id} is unreadable: {error}")
+    continue
+  got = (record.get("totalPrompts") or 0, record.get("todayTotalTokens") or 0)
+  if got != want:
+    problems.append(f"{id} counted (prompts, tokens) {got}, expected {want}")
+print("\n".join(problems))
+PY
+)
+if [[ -z $forked_report ]]; then
+  pass "a pi or omp prompt a fork answered on another provider counts once, under the provider that answered it"
+else
+  fail "a pi or omp prompt a fork answered on another provider counts once, under the provider that answered it" "$forked_report"
+fi

@@ -803,10 +803,10 @@ def _pi_row(entry: dict, timestamp: Any, path: str, provider: str, model: str, u
   return _pi_key(entry, timestamp, path), UsageRow(day, path, provider, model, input_tokens, output_tokens, cache_read, cache_write, prompts)
 
 
-def _pi_rows(path: str, lines: list[tuple[int, Any]], accept: Accept) -> Iterator[tuple[int, tuple, UsageRow, tuple]]:
-  """(line number, dedup key, row, prompt keys) for each (line number,
-  entry) of one session file, in order, that `accept` takes, the prompt keys
-  naming the typed prompts the row's `prompts` count.
+def _pi_rows(path: str, lines: list[tuple[int, Any]], accept: Accept) -> Iterator[tuple[int, tuple, UsageRow, tuple, bool]]:
+  """(line number, dedup key, row, prompt keys, whether `accept` takes it)
+  for each (line number, entry) of one session file, in order, whoever's,
+  the prompt keys naming the typed prompts the row's `prompts` count.
 
   `lines` hold every model switch, user and assistant message in the file.
   Usage with no provider of its own bills the model the session was on: the
@@ -835,18 +835,19 @@ def _pi_rows(path: str, lines: list[tuple[int, Any]], accept: Accept) -> Iterato
   # or () for one omp refused before sending it.
   failed: tuple | None = None
 
-  def unanswered() -> Iterator[tuple[int, tuple, UsageRow, tuple]]:
+  def takes(provider: str, model: str, reference: dict) -> bool:
+    try:
+      return bool(accept(provider, model, reference))
+    except Exception:
+      return False
+
+  def unanswered() -> Iterator[tuple[int, tuple, UsageRow, tuple, bool]]:
     for line_number, key, day, before in asked:
       target = before if failed is None else failed
       if day is None or not target:
         continue
       provider, model, reference = target
-      try:
-        if not accept(provider, model, reference):
-          continue
-      except Exception:
-        continue
-      yield line_number, ("asked", *key), UsageRow(day, path, provider, model, 0, 0, 0, 0, 1), (key,)
+      yield line_number, ("asked", *key), UsageRow(day, path, provider, model, 0, 0, 0, 0, 1), (key,), takes(provider, model, reference)
 
   for line_number, entry, line in parsed:
     try:
@@ -886,13 +887,12 @@ def _pi_rows(path: str, lines: list[tuple[int, Any]], accept: Accept) -> Iterato
           answered, asked, failed = asked, [], None
         elif asked and failed is None:
           failed = () if _pi_unsent(reference) else (provider, model, reference)
-      if not accept(provider, model, reference):
-        continue
     except Exception:
       # One odd line costs that line, never the scan.
       continue
     if counted is None:
       continue
+    taken = takes(provider, model, reference)
     key, row = counted
     # Prompts typed on the reply's day ride on its row; one typed on another
     # day is a row of its own there, keyed by the reply that answered it.
@@ -901,9 +901,9 @@ def _pi_rows(path: str, lines: list[tuple[int, Any]], accept: Accept) -> Iterato
       if day is not None:
         days.setdefault(day, []).append(prompt)
     asks = days.pop(row.day, [])
-    yield line_number, key, row._replace(prompts=row.prompts + len(asks)), tuple(asks)
+    yield line_number, key, row._replace(prompts=row.prompts + len(asks)), tuple(asks), taken
     for day, asks in sorted(days.items()):
-      yield line_number, ("prompt", day, *key), UsageRow(day, path, provider, model, 0, 0, 0, 0, len(asks)), tuple(asks)
+      yield line_number, ("prompt", day, *key), UsageRow(day, path, provider, model, 0, 0, 0, 0, len(asks)), tuple(asks), taken
   yield from unanswered()
 
 
@@ -944,11 +944,31 @@ def scan_pi_sessions(pattern: str, accept: Accept, roots: Iterable[Path] | None 
   complete = True
   # Each file's lines, folded in order when rg finishes the file.
   pending: dict[str, list[tuple[int, Any]]] = {}
+  # Every booking of each typed prompt, whichever provider took it, so one a
+  # fork answered on another provider books under one collector alone.
+  bookings: dict[tuple, list[tuple]] = {}
+  read: set[str] = set()
+  parents: dict[str, str | None] = {}
 
-  def fold(index: int, path: str) -> None:
-    lines = sorted(pending.pop(path, []), key=lambda line: line[0])
-    for line_number, key, row, asks in _pi_rows(path, lines, accept):
-      found.append((index, path, line_number, key, row, asks))
+  def ancestors(path: str) -> set[str]:
+    found: set[str] = set()
+    parent = parents.setdefault(path, pi_parent_session(path))
+    while parent and parent not in found and parent != path:
+      found.add(parent)
+      parent = parents.setdefault(parent, pi_parent_session(parent))
+    return found
+
+  def fold(index: int | None, path: str) -> None:
+    # `index` None reads a file for its bookings alone.
+    read.add(path)
+    depth = len(ancestors(path))
+    for line_number, key, row, asks, taken in _pi_rows(path, sorted(pending.pop(path, []), key=lambda line: line[0]), accept):
+      for ask in asks:
+        # An answer before a prompt no reply answered, the oldest session's
+        # first, as a fork copies its parent's.
+        bookings.setdefault(ask, []).append((key[0] == "asked", depth, path, line_number, (key, row.provider, row.model)))
+      if taken and index is not None:
+        found.append((index, path, line_number, key, row, asks))
 
   def run_rg(args: list[str], targets: list[bytes]) -> Iterator[bytes]:
     """rg's output lines for `args` over `targets`, a batch of them at a time
@@ -1029,16 +1049,43 @@ def scan_pi_sessions(pattern: str, accept: Accept, roots: Iterable[Path] | None 
     for path in list(pending):
       fold(index, path)
 
+  # A prompt's copies live in the forks of the session it was typed in, so
+  # the other files of those fork trees are read for their bookings alone:
+  # each collector then picks the same one among them.
+  children: dict[str, list[str]] = {}
+  for name in matching_files([os.fsencode(root) for root in roots], [r'"parentSession"']) if read else ():
+    path = os.fsdecode(name)
+    parent = parents.setdefault(path, pi_parent_session(path))
+    if parent:
+      children.setdefault(parent, []).append(path)
+  family: set[str] = set()
+  queue = list(read)
+  while queue:
+    path = queue.pop()
+    if path in family:
+      continue
+    family.add(path)
+    queue.extend(ancestors(path) | set(children.get(path, ())))
+  others = sorted(os.fsencode(path) for path in family - read if any(Path(path).is_relative_to(root) for root in roots))
+  for kind, path, line_number, entry in match_events(others, [context]):
+    if kind == "end":
+      fold(None, path)
+    else:
+      pending.setdefault(path, []).append((line_number, entry))
+  for path in list(pending):
+    fold(None, path)
+  owner = {ask: min(candidates, key=lambda candidate: candidate[:4])[-1] for ask, candidates in bookings.items()}
+
   first: dict[tuple, UsageRow] = {}
   holders: dict[tuple, list[str]] = {}
-  # A typed prompt is its own message, so it counts once by its own key
-  # however it was booked: a fork can copy one its parent left unanswered
-  # and answer it, booking it on a reply the parent never had.
-  claimed: set[tuple] = set()
   for _, path, _, key, row, asks in sorted(found, key=lambda item: item[:3]):
     if key not in first:
-      repeated = sum(1 for ask in asks if ask in claimed)
-      claimed.update(asks)
+      # A typed prompt is its own message, so it counts once by its own key
+      # however it was booked: a fork can copy one its parent left
+      # unanswered and answer it, on a reply the parent never had and on
+      # another provider too. The oldest session's answer books it, else
+      # its booking unanswered, whichever collector that is.
+      repeated = sum(1 for ask in asks if owner.get(ask) != (key, row.provider, row.model))
       row = row._replace(prompts=row.prompts - repeated)
       first[key] = row
     if path not in holders.setdefault(key, []):
@@ -1046,16 +1093,6 @@ def scan_pi_sessions(pattern: str, accept: Accept, roots: Iterable[Path] | None 
 
   # Resolved after the scan, so rg's file order cannot decide which copy of
   # a forked message counts toward which session.
-  parents: dict[str, str | None] = {}
-
-  def ancestors(path: str) -> set[str]:
-    found: set[str] = set()
-    parent = parents.setdefault(path, pi_parent_session(path))
-    while parent and parent not in found and parent != path:
-      found.add(parent)
-      parent = parents.setdefault(parent, pi_parent_session(parent))
-    return found
-
   rows = []
   for key, row in first.items():
     if not (row.prompts or row.input_tokens or row.output_tokens or row.cache_read or row.cache_write):
