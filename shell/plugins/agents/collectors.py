@@ -1244,40 +1244,49 @@ def scan_opencode(providers: Iterable[str], accept: Accept) -> tuple[list[UsageR
         # a message older than its session was spent in the source.
         source += " LEFT JOIN session s ON s.id = m.session_id"
         session_created = "s.time_created"
+      gate = " OR ".join("m.data LIKE ?" for _ in patterns)
+      # This collector's own steps and prompts, read before the first steps
+      # they need, which are looked up for their sessions alone.
+      own_steps = list(conn.execute(
+        f"SELECT {row_id}, m.session_id, m.data, {session_created} FROM {source}"
+        f" WHERE m.data LIKE '%\"role\"%:%\"assistant\"%' AND ({gate})",
+        patterns,
+      ))
+      own_prompts = list(conn.execute(
+        f"SELECT {row_id}, m.session_id, m.data, {session_created} FROM {source}"
+        f" WHERE m.data LIKE '%\"role\"%:%\"user\"%' AND ({gate})",
+        patterns,
+      ))
       # The first step that spent tokens on each user message across every
       # provider, so a tool loop that switches providers books its prompt
       # once, on whichever collector took that step. Only valid JSON is read,
-      # so one odd row can't fail the query.
+      # so one odd row can't fail the query. A session's first steps are its
+      # own, so only the sessions above are read, through opencode's index on
+      # session_id, each id as stored.
+      sessions = list(dict.fromkeys(session_id for _, session_id, _, _ in own_steps + own_prompts))
       spent = " + ".join(f"COALESCE(json_extract(j, '$.tokens.{key}'), 0)" for key in ("input", "output", "reasoning", "cache.read", "cache.write"))
       for session_id, parent, first_id in conn.execute(
         "SELECT session_id, parent, id FROM (SELECT session_id, parent, id,"
         " ROW_NUMBER() OVER (PARTITION BY session_id, parent ORDER BY created, CAST(id AS TEXT)) AS n"
         " FROM (SELECT id, session_id, j, since, json_extract(j, '$.parentID') AS parent, json_extract(j, '$.time.created') AS created"
         f" FROM (SELECT {row_id} AS id, m.session_id, CASE WHEN json_valid(m.data) THEN m.data END AS j, {session_created} AS since"
-        f" FROM {source} WHERE m.data LIKE '%\"parentID\"%' AND m.data LIKE '%\"role\"%:%\"assistant\"%'))"
+        f" FROM {source} WHERE m.session_id IN (SELECT value FROM json_each(?))"
+        " AND m.data LIKE '%\"parentID\"%' AND m.data LIKE '%\"role\"%:%\"assistant\"%'))"
         " WHERE typeof(parent) = 'text' AND parent != '' AND (created IS NULL OR created > 0)"
         " AND (since IS NULL OR created IS NULL OR created >= since)"
         " AND json_extract(j, '$.summary') IS NOT 1 AND json_extract(j, '$.mode') IS NOT 'compaction'"
-        f" AND {spent} > 0) WHERE n = 1"
-      ):
+        f" AND {spent} > 0) WHERE n = 1",
+        (json.dumps(sessions, default=str),),
+      ) if sessions else ():
         firsts[(str(session_id), str(parent))] = str(first_id)
-      gate = " OR ".join("m.data LIKE ?" for _ in patterns)
-      for message_id, session_id, raw, since in conn.execute(
-        f"SELECT {row_id}, m.session_id, m.data, {session_created} FROM {source}"
-        f" WHERE m.data LIKE '%\"role\"%:%\"assistant\"%' AND ({gate})",
-        patterns,
-      ):
+      for message_id, session_id, raw, since in own_steps:
         take(message_id, session_id, raw, "", None, since)
       # A typed prompt no step answered (its request failed, or none came)
       # books itself, without tokens, on the model the user row names, the
       # one opencode sent it to. A compaction's marker is answered by its
       # summary, and one in a subagent's session isn't typed.
       waiting: list[tuple[Any, str, dict]] = []
-      for message_id, session_id, raw, since in conn.execute(
-        f"SELECT {row_id}, m.session_id, m.data, {session_created} FROM {source}"
-        f" WHERE m.data LIKE '%\"role\"%:%\"user\"%' AND ({gate})",
-        patterns,
-      ):
+      for message_id, session_id, raw, since in own_prompts:
         try:
           entry = json.loads(raw)
           if not isinstance(entry, dict) or entry.get("role") != "user" or str(session_id) in children or (str(session_id), str(message_id)) in firsts:

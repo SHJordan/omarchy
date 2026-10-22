@@ -2162,3 +2162,108 @@ if [[ -z $stranded_report ]]; then
 else
   fail "a prompt killed mid-request, a reply omp wrote twice and a request omp never sent each count once or nowhere" "$stranded_report"
 fi
+
+# A collector reads only its own share of opencode's `message` store. Finding
+# the first step answering each prompt across providers once read every
+# assistant row in the database on each collector's rebuild, so a collector
+# with no rows there paid for everyone's history. Counted in SQLite VM steps,
+# not seconds, so a slow machine can't flake it: a collector with one session
+# among a thousand others' costs no more than a few gated scans of the table,
+# and still books its prompt only where the first step is its own.
+OC_SCALE_HOME="$WORK/oc-scale-home"
+mkdir -p "$OC_SCALE_HOME"
+oc_scale_report=$(python3 - "$ROOT" "$OC_SCALE_HOME" <<'PY'
+import json
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+root, home = Path(sys.argv[1]), Path(sys.argv[2])
+os.environ["HOME"] = str(home)
+os.environ["XDG_DATA_HOME"] = str(home / ".local/share")
+os.environ.pop("OPENCODE_DB", None)
+sys.path.insert(0, str(root / "shell" / "plugins" / "agents"))
+import collectors
+
+db = home / ".local/share/opencode/opencode.db"
+db.parent.mkdir(parents=True, exist_ok=True)
+conn = sqlite3.connect(db)
+# The schema opencode 1.x creates, its session index included.
+conn.execute("CREATE TABLE session (id text PRIMARY KEY, parent_id text, title text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL)")
+conn.execute("CREATE TABLE message (id text PRIMARY KEY, session_id text NOT NULL, time_created integer NOT NULL, time_updated integer NOT NULL, data text NOT NULL)")
+conn.execute("CREATE INDEX message_session_time_created_id_idx ON message (session_id, time_created, id)")
+now_ms = int(time.time() * 1000) - 60000
+tokens = {"total": 1320, "input": 1200, "output": 20, "reasoning": 0, "cache": {"write": 0, "read": 100}}
+rows = []
+
+
+def prompt(session, n, providers):
+  # A typed prompt and the tool loop answering it, one step per provider.
+  at = now_ms + n * 100
+  rows.append((f"msg_{session}_u{n}", session, at, {"role": "user", "time": {"created": at}, "agent": "build", "model": {"providerID": providers[0], "modelID": "m"}, "summary": {"diffs": []}}))
+  for step, provider in enumerate(providers, 1):
+    rows.append((f"msg_{session}_a{n}_{step}", session, at + step, {"parentID": f"msg_{session}_u{n}", "role": "assistant", "mode": "build", "agent": "build", "path": {"cwd": "/home/me", "root": "/"}, "cost": 0, "tokens": tokens, "modelID": "m", "providerID": provider, "time": {"created": at + step, "completed": at + step + 1}, "finish": "tool-calls"}))
+
+
+sessions = [f"ses_other{s:04d}" for s in range(1000)]
+for session in sessions:
+  for n in range(3):
+    prompt(session, n, ["anthropic"] * 4)
+# The collector's one session: a prompt it answered first, and one whose
+# first step was another provider's.
+sessions.append("ses_mine")
+prompt("ses_mine", 0, ["devin", "devin"])
+prompt("ses_mine", 1, ["anthropic", "devin"])
+for session in sessions:
+  conn.execute("INSERT INTO session VALUES (?, NULL, 't', ?, ?)", (session, now_ms - 1000, now_ms - 1000))
+conn.executemany("INSERT INTO message VALUES (?, ?, ?, ?, ?)", [(mid, session, at, at, json.dumps(data)) for mid, session, at, data in rows])
+conn.commit()
+conn.close()
+
+steps = [0]
+connect = sqlite3.connect
+
+
+def counted(*args, **kwargs):
+  handle = connect(*args, **kwargs)
+  handle.set_progress_handler(lambda: steps.__setitem__(0, steps[0] + 1), 100)
+  return handle
+
+
+def cost(run):
+  steps[0] = 0
+  sqlite3.connect = counted
+  try:
+    result = run()
+  finally:
+    sqlite3.connect = connect
+  return steps[0], result
+
+
+def gated_scan():
+  handle = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)
+  try:
+    return handle.execute("SELECT m.id, m.data FROM message m WHERE m.data LIKE '%\"role\"%:%\"assistant\"%' AND m.data LIKE ?", ('%"providerID"%:%"devin"%',)).fetchall()
+  finally:
+    handle.close()
+
+
+scan_cost, (found, complete) = cost(lambda: collectors.scan_opencode(['devin"'], lambda provider, model, entry: provider == "devin"))
+gate_cost, _ = cost(gated_scan)
+problems = []
+if not complete:
+  problems.append("the scan did not complete")
+if (len(found), sum(row.prompts for row in found)) != (3, 1):
+  problems.append(f"devin's rows {len(found)} with {sum(row.prompts for row in found)} prompts, expected 3 with 1")
+if scan_cost > 6 * gate_cost:
+  problems.append(f"scan_opencode took {scan_cost} progress ticks, over 6x the {gate_cost} of one gated scan")
+print("\n".join(problems))
+PY
+)
+if [[ -z $oc_scale_report ]]; then
+  pass "a collector's opencode scan costs a few gated scans of the store, not a pass over every provider's steps"
+else
+  fail "a collector's opencode scan costs a few gated scans of the store, not a pass over every provider's steps" "$oc_scale_report"
+fi
