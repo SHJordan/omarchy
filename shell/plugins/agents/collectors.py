@@ -2202,15 +2202,14 @@ def claude_code_scan_match(claude_dir: Path | None = None) -> dict[str, str]:
 # ------------------------------------------------------- Codex rollouts
 #
 # Codex writes one JSONL rollout per session under $CODEX_HOME/sessions (and
-# archived_sessions), naming the model provider it ran on. The Codex
-# collector reads its own `openai` rollouts with a reader of its own; the
-# rest (`--oss` on a local daemon, a custom model_providers entry) are read
-# here for the collectors that bill them: the local collector for a
-# self-hosted provider, Ollama Cloud for a cloud-tagged model the local
-# daemon forwarded, and a provider's collector for a model_providers entry
-# whose base_url is that provider's host (codex_route_owner). While
-# openai_base_url sends the built-in provider elsewhere, its rollouts are read
-# here too.
+# archived_sessions), naming the model provider it ran on. Every rollout is
+# read here, once for every collector that bills one: the Codex collector its
+# own `openai` rollouts, and the rest (`--oss` on a local daemon, a custom
+# model_providers entry) the local collector for a self-hosted provider,
+# Ollama Cloud for a cloud-tagged model the local daemon forwarded, and a
+# provider's collector for a model_providers entry whose base_url is that
+# provider's host (codex_route_owner). While openai_base_url sends the
+# built-in provider elsewhere, its models are split the same way.
 
 # The Codex collector counts rollouts on the built-in provider, and ones too
 # old to name a provider at all.
@@ -2225,9 +2224,10 @@ CODEX_WINDOW_DAYS = 30
 # version 3 those that counted every request as a prompt, version 4 those
 # that missed the responses only Codex 0.163's token_usage_record lines name,
 # version 5 those with no session, version 6 those that left a built-in
-# rollout unread without saying so, and version 7 those that booked a
-# switched-to model's first requests to the model before it.
-CODEX_ROLLOUT_SCHEMA = 7
+# rollout unread without saying so, version 7 those that booked a
+# switched-to model's first requests to the model before it, and version 8
+# those that read no turns from a rollout naming no session_meta.
+CODEX_ROLLOUT_SCHEMA = 8
 
 _CODEX_MARKERS = (
   '"token_count"', '"token_usage_record"', '"turn_context"', '"thread_settings_applied"', '"session_meta"', '"user_message"', '"UserMessage"',
@@ -2271,7 +2271,7 @@ def _codex_typed_prompt(entry: dict[str, Any]) -> bool:
   return payload.get("type") == "item_completed" and obj(payload.get("item")).get("type") == "UserMessage"
 
 
-def codex_settings_model(entry: dict[str, Any]) -> str:
+def _codex_settings_model(entry: dict[str, Any]) -> str:
   """The model a thread_settings_applied event switches the thread to, or "".
   Codex 0.163 writes one when `-m` on a resume or /model picks another model,
   ahead of any request on it: a compaction the switch sends goes out on the
@@ -2368,10 +2368,10 @@ def _codex_resume(handle: Any, previous: dict[str, Any]) -> dict[str, Any] | Non
 
 def read_codex_rollout(path: Path, stat_result: os.stat_result, previous: dict[str, Any] | None = None, native: bool = False) -> dict[str, Any]:
   """One rollout's provider, session (codex_rollout_session) and day ->
-  model -> [input, output, cacheRead, cacheWrite, prompts], counted the way
-  the Codex collector counts its own. A rollout on the built-in provider, or
-  naming none, is left unread and marked `skipped`, unless `native` asks for
-  it: openai_base_url can send those elsewhere.
+  model -> [input, output, cacheRead, cacheWrite, prompts]. A rollout on the
+  built-in provider, or naming none, is left unread and marked `skipped`,
+  unless `native` asks for it, as the Codex collector does and
+  openai_base_url can.
 
   A prompt counts on its own day, under the model that answered it: the one
   in effect at the next request, since a legacy rollout can write the prompt
@@ -2463,7 +2463,14 @@ def read_codex_rollout(path: Path, stat_result: os.stat_result, previous: dict[s
             record["session"] = codex_rollout_session(meta, typed, path)
             continue
           if not seen_meta:
-            continue
+            # A rollout from before Codex wrote session_meta names no
+            # provider, so its turns are the built-in provider's.
+            if not native:
+              record["skipped"] = True
+              done = True
+              break
+            seen_meta = True
+            current_model = "codex"
           if _codex_typed_prompt(entry):
             # A prompt with no time is the file's; one whose time can't be
             # trusted counts nowhere.
@@ -2478,7 +2485,7 @@ def read_codex_rollout(path: Path, stat_result: os.stat_result, previous: dict[s
             payload = obj(entry.get("payload"))
             current_model = str(payload.get("model") or payload.get("model_slug") or current_model)
             continue
-          switched = codex_settings_model(entry)
+          switched = _codex_settings_model(entry)
           if switched:
             current_model = switched
             continue

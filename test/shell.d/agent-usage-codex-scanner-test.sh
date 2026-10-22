@@ -284,7 +284,7 @@ pi = write_pi_session(home() / ".pi" / "agent" / "sessions" / "session.jsonl", [
 
 
 def file_cache():
-  return json.loads(next(cache_root().glob("codex-files-*.json")).read_text())
+  return json.loads(next(cache_root().glob("codex-rollouts-*.json")).read_text())
 
 
 def incremental(*args):
@@ -315,6 +315,19 @@ if os.geteuid() != 0:
 rollout("rollout.jsonl", tokens(30, 2, 10), stamp=early, mode="a")
 record = incremental()
 expect("Codex rereads a rollout that grew", record["todayTotalTokens"], 52, record)
+
+# A long session's rollout that grew is read on from where the last read
+# stopped, through the reader every collector shares, not again from the
+# start: a request rewritten in the middle of what was read, the same size,
+# still counts as it was read.
+padding = {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "x" * 6000}]}}
+grown = rollout("rollout-grown.jsonl", meta(model_provider="openai", source="exec", id="t-grown"), context("gpt-grown"), typed(), tokens(10, 5),
+                padding, padding, tokens(100, 0), padding, padding, tokens(1, 0), stamp=early)
+incremental()
+grown.write_text(grown.read_text().replace('"input_tokens": 100,', '"input_tokens": 900,'))
+rollout("rollout-grown.jsonl", typed(), tokens(30, 2), stamp=early, mode="a")
+record = incremental()
+expect("Codex reads a grown rollout on from where it stopped", record["todayTokensByModel"].get("gpt-grown"), 148, record)
 
 # Per-file totals are bucketed by local day, so a new timezone reads them again.
 zone_stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT02:00:00Z")
