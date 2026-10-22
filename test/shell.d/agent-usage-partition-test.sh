@@ -2466,3 +2466,95 @@ if [[ -z $codex_mixed_report ]]; then
 else
   fail "a Codex rollout switching from an OpenAI model to a local one books each prompt once, with the model that answered it" "$codex_mixed_report"
 fi
+
+# `codex exec -m <model> resume` and /model switch a thread's model with a
+# thread_settings_applied event, as Codex 0.163 writes it, and the request a
+# switch-time compaction sends goes out on the new model before that turn's
+# turn_context names it. Behind a self-hosted openai_base_url the compaction
+# is local's, as is a prompt typed after the switch that no request answered.
+CODEX_SWITCH_HOME="$WORK/codex-switched-models"
+mkdir -p "$CODEX_SWITCH_HOME/.codex"
+printf 'openai_base_url = "http://127.0.0.1:18496/v1"\n' >"$CODEX_SWITCH_HOME/.codex/config.toml"
+python3 - "$CODEX_SWITCH_HOME" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+home = Path(sys.argv[1])
+stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+rollouts = home / ".codex/sessions" / datetime.now().strftime("%Y/%m/%d")
+rollouts.mkdir(parents=True)
+
+
+def context(model):
+  return lambda thread, n: {"type": "turn_context", "payload": {"model": model, "turn_id": f"turn{n}"}}
+
+
+def switch(model):
+  return lambda thread, n: {"type": "event_msg", "payload": {"type": "thread_settings_applied", "thread_id": thread, "thread_settings": {
+    "model": model, "model_provider_id": "openai", "approval_policy": "never", "approvals_reviewer": "auto_review",
+    "collaboration_mode": {"mode": "default", "settings": {"model": model, "reasoning_effort": None, "developer_instructions": None}},
+    "cwd": str(home), "disabled_plugin_ids": [], "runtime_workspace_roots": [str(home)]}}}
+
+
+def typed(thread, n):
+  item = {"type": "UserMessage", "id": f"01a164cc-7301-7231-a532-dda74a01{n:04d}", "content": [{"type": "text", "text": "go", "text_elements": []}]}
+  return {"type": "event_msg", "payload": {"type": "item_completed", "thread_id": thread, "turn_id": f"turn{n}", "item": item}}
+
+
+def compacted(thread, n):
+  return {"type": "compacted", "payload": {"message": "", "replacement_history": []}}
+
+
+def write(thread, steps):
+  """A rollout of `steps`: line makers, and the input tokens of each request
+  a token_usage_record names."""
+  total = {"input_tokens": 0, "cached_input_tokens": 0, "cache_write_input_tokens": 0, "output_tokens": 0, "reasoning_output_tokens": 0, "total_tokens": 0}
+  lines = [{"type": "session_meta", "payload": {"session_id": thread, "id": thread, "cli_version": "0.163.0", "history_mode": "paginated", "originator": "codex_exec", "source": "exec", "thread_source": "user", "model_provider": "openai"}}]
+  for n, step in enumerate(steps):
+    if isinstance(step, int):
+      usage = {"input_tokens": step, "cached_input_tokens": 71, "cache_write_input_tokens": 31, "output_tokens": 51, "reasoning_output_tokens": 0, "total_tokens": step + 51}
+      total = {key: total[key] + usage[key] for key in total}
+      lines.append({"type": "token_usage_record", "payload": {"thread_id": thread, "turn_id": f"turn{n}", "session_id": thread, "response_id": f"resp_zs_{n:04d}", "usage": usage, "turn_token_usage": usage, "thread_token_usage": total}})
+    else:
+      lines.append(step(thread, n))
+  (rollouts / f"rollout-2026-10-22T14-07-55-{thread}.jsonl").write_text("".join(json.dumps({"timestamp": stamp, **line}) + "\n" for line in lines))
+
+
+local = "hf:zai-org/GLM-4.6-zs961"
+write("01a164cc-54d9-7f81-80d2-0cbf0cd6a960", [
+  context("gpt-5.1-codex-zs960"), switch("gpt-5.1-codex-zs960"), typed, 301234,
+  switch(local), switch(local), 2234, compacted, context(local), switch(local), typed, 3234,
+])
+write("01a164cc-54d9-7f81-80d2-0cbf0cd6a962", [context("gpt-5.1-codex-zs962"), typed, 1234, switch(local), typed])
+PY
+run_collector "$CODEX_SWITCH_HOME" codex "$WORK/codex-switched-codex"
+run_collector "$CODEX_SWITCH_HOME" local "$WORK/codex-switched-local"
+codex_switched_report=$(python3 - "$WORK/codex-switched-codex.json" "$WORK/codex-switched-local.json" <<'PY'
+import json
+import sys
+
+expected = {
+  "codex-switched-codex.json": ({"gpt-5.1-codex-zs960": 301285, "gpt-5.1-codex-zs962": 1285}, 2, 2),
+  "codex-switched-local.json": ({"hf:zai-org/GLM-4.6-zs961": 2285 + 3285}, 2, 2),
+}
+problems = []
+for path in sys.argv[1:]:
+  name = path.rsplit("/", 1)[-1]
+  try:
+    record = json.load(open(path))
+  except (OSError, ValueError) as error:
+    problems.append(f"{name} is unreadable: {error}")
+    continue
+  got = (record.get("todayTokensByModel"), record.get("totalPrompts"), record.get("totalSessions"))
+  if got != expected[name]:
+    problems.append(f"{name} counts tokens, prompts and sessions {got}, expected {expected[name]}")
+print("\n".join(problems))
+PY
+)
+if [[ -z $codex_switched_report ]]; then
+  pass "a Codex model switch books the requests and prompts after thread_settings_applied to the model switched to"
+else
+  fail "a Codex model switch books the requests and prompts after thread_settings_applied to the model switched to" "$codex_switched_report"
+fi

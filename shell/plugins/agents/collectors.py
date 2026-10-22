@@ -2224,11 +2224,14 @@ CODEX_WINDOW_DAYS = 30
 # 2 drops totals cached while an untrusted time still counted on the file's day,
 # version 3 those that counted every request as a prompt, version 4 those
 # that missed the responses only Codex 0.163's token_usage_record lines name,
-# version 5 those with no session, and version 6 those that left a built-in
-# rollout unread without saying so.
-CODEX_ROLLOUT_SCHEMA = 6
+# version 5 those with no session, version 6 those that left a built-in
+# rollout unread without saying so, and version 7 those that booked a
+# switched-to model's first requests to the model before it.
+CODEX_ROLLOUT_SCHEMA = 7
 
-_CODEX_MARKERS = ('"token_count"', '"token_usage_record"', '"turn_context"', '"session_meta"', '"user_message"', '"UserMessage"')
+_CODEX_MARKERS = (
+  '"token_count"', '"token_usage_record"', '"turn_context"', '"thread_settings_applied"', '"session_meta"', '"user_message"', '"UserMessage"',
+)
 
 # What a token_usage_record's running total is compared by.
 _CODEX_USAGE_FIELDS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens")
@@ -2266,6 +2269,18 @@ def _codex_typed_prompt(entry: dict[str, Any]) -> bool:
   if payload.get("type") == "user_message":
     return payload.get("kind") in (None, "plain")
   return payload.get("type") == "item_completed" and obj(payload.get("item")).get("type") == "UserMessage"
+
+
+def codex_settings_model(entry: dict[str, Any]) -> str:
+  """The model a thread_settings_applied event switches the thread to, or "".
+  Codex 0.163 writes one when `-m` on a resume or /model picks another model,
+  ahead of any request on it: a compaction the switch sends goes out on the
+  new model before that turn's turn_context names it."""
+  payload = obj(entry.get("payload"))
+  if entry.get("type") != "event_msg" or payload.get("type") != "thread_settings_applied":
+    return ""
+  settings = obj(payload.get("thread_settings"))
+  return str(settings.get("model") or obj(obj(settings.get("collaboration_mode")).get("settings")).get("model") or "")
 
 
 def _codex_typed_session(meta: dict[str, Any]) -> bool:
@@ -2462,6 +2477,10 @@ def read_codex_rollout(path: Path, stat_result: os.stat_result, previous: dict[s
           if entry.get("type") == "turn_context":
             payload = obj(entry.get("payload"))
             current_model = str(payload.get("model") or payload.get("model_slug") or current_model)
+            continue
+          switched = codex_settings_model(entry)
+          if switched:
+            current_model = switched
             continue
           if entry.get("type") == "token_usage_record":
             seen_records = True

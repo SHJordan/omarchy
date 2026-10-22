@@ -38,6 +38,7 @@ from collectors import (  # noqa: E402
   codex_rollout_session,
   codex_route_owner,
   codex_scan_match,
+  codex_settings_model,
   emit,
   find_command,
   jwt_claims,
@@ -86,9 +87,9 @@ TRANSPORT_ERRORS = (
 # falsy time still counted on the file's day, version 4 counts typed prompts
 # apart from the requests that answered them, version 5 counts Codex 0.163's
 # token_usage_record lines, version 6 books a subagent's thread under the
-# session that started it, and version 7 keeps each prompt under the model
-# that answered it.
-FILE_CACHE_SCHEMA = 7
+# session that started it, version 7 keeps each prompt under the model that
+# answered it, and version 8 switches models at thread_settings_applied.
+FILE_CACHE_SCHEMA = 8
 
 
 
@@ -302,7 +303,9 @@ def scan_native_codex_sessions(cached_files, scanned_files):
 
 # The rollout lines the reader parses: usage, the model and provider serving
 # it, and the prompts typed.
-ROLLOUT_MARKERS = ('"token_count"', '"token_usage_record"', '"turn_context"', '"session_meta"', '"user_message"', '"UserMessage"')
+ROLLOUT_MARKERS = (
+  '"token_count"', '"token_usage_record"', '"turn_context"', '"thread_settings_applied"', '"session_meta"', '"user_message"', '"UserMessage"',
+)
 
 
 # What a token_usage_record's running total is compared by.
@@ -373,6 +376,13 @@ def read_native_codex_session(path, stat_result):
         if entry.get("type") == "turn_context":
           payload = obj(entry.get("payload"))
           current_model = model_name(payload.get("model") or payload.get("model_slug") or current_model)
+          continue
+        # A model picked with `-m` on a resume or /model is in effect from
+        # here: a compaction the switch sends goes out on it before that
+        # turn's turn_context names it.
+        switched = codex_settings_model(entry)
+        if switched:
+          current_model = switched
           continue
         if entry.get("type") == "token_usage_record":
           seen_records = True
