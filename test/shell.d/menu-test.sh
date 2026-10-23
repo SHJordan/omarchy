@@ -271,6 +271,7 @@ const expectedAgents = {
   copilot: { icon: '', label: 'Copilot' },
   crush: { icon: '󰋑', label: 'Crush' },
   muse: { icon: '󰛤', label: 'Muse Code' },
+  omo: { icon: '', label: 'OmO' },
   'cursor-agent': { icon: '\ue90d', iconFont: 'omarchy', label: 'Cursor CLI' },
 
 }
